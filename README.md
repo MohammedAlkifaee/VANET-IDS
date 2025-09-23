@@ -5,8 +5,8 @@
 Mohammad Abbas Alkifaee¹ (ORCID: [0009-0004-3731-0886](https://orcid.org/0009-0004-3731-0886))  
 Supervisor: Dr. Fahad Ghalib Abdulkadhim² (ORCID: [0000-0002-4922-0878](https://orcid.org/0000-0002-4922-0878))
 
-¹ Affiliation: *[Department of Computer Science and Mathematics, University of Kufa, Najaf, Iraq]*  
-² Affiliation: *[Department of Computer Science and Mathematics, University of Kufa, Najaf, Iraq]*  
+*[Department of Computer Science and Mathematics, University of Kufa, Najaf, Iraq]*  
+
 
 ---
 
