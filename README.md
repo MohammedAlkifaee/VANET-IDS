@@ -11,7 +11,7 @@ We implement an RSU-centric intrusion-detection and trust-gating workflow that c
 Per-sender operating points are adapted via a Beta-trust posterior, allowing sensitivity to track the amount and quality of evidence. A PyQt5 application is included to select datasets, train models, and visualize evaluation outputs such as AUC, precision–recall profiles, and confusion matrices.
 
 Data Availability
-Dataset DOI/URL: [10.5281/zenodo.17167970.<img width="468" height="12" alt="image" src="https://github.com/user-attachments/assets/d63e59aa-d7ba-4b44-8519-8a67be444baa" />]
+Dataset DOI/URL: [10.5281/zenodo.17167970]
 
 Update this placeholder with the canonical link to your dataset repository (e.g., Zenodo, OSF, Kaggle).
 Expected CSV schema
