@@ -1,45 +1,73 @@
-# Trust-Gated Hybrid Intrusion Detection for VANETs
-**Lightweight OBU Screening with RSU Supervised Fusion (v7)**
+Trust-Gated Hybrid VANET IDS
+Lightweight OBU Screening with RSU-Supervised Evidence Fusion (v7)
+Authors
+Mohammad Abbas Alkifaee¹ (ORCID: 0009-0004-3731-0886)
+Supervisor: Dr. Fahad Ghalib Abdulkadhim² (ORCID: 0000-0002-4922-0878)
+Department of Computer Science and Mathematics, University of Kufa, Najaf, Iraq
 
-**Authors**  
-Mohammad Abbas Alkifaee¹ (ORCID: [0009-0004-3731-0886](https://orcid.org/0009-0004-3731-0886))  
-Supervisor: Dr. Fahad Ghalib Abdulkadhim² (ORCID: [0000-0002-4922-0878](https://orcid.org/0000-0002-4922-0878))
+Abstract
+This repository hosts the artifacts for the study “Trust-Gated Hybrid VANET IDS: Lightweight OBU Screening with RSU-Supervised Evidence Fusion.”
+We implement an RSU-centric intrusion-detection and trust-gating workflow that couples: (i) fast physics- and protocol-plausibility flags that accumulate trust evidence, (ii) short-horizon temporal descriptors per sender, (iii) a calibrated gradient-boosting screener for the binary decision, (iv) optional family-specific heads—including a BiLSTM module targeting replay/staleness—and (v) a logistic stacking layer for decision fusion.
+Per-sender operating points are adapted via a Beta-trust posterior, allowing sensitivity to track the amount and quality of evidence. A PyQt5 application is included to select datasets, train models, and visualize evaluation outputs such as AUC, precision–recall profiles, and confusion matrices.
 
-*[Department of Computer Science and Mathematics, University of Kufa, Najaf, Iraq]*  
+Data Availability
+Dataset DOI/URL: [10.5281/zenodo.17167970.<img width="468" height="12" alt="image" src="https://github.com/user-attachments/assets/d63e59aa-d7ba-4b44-8519-8a67be444baa" />]
+
+Update this placeholder with the canonical link to your dataset repository (e.g., Zenodo, OSF, Kaggle).
+Expected CSV schema
 
 
----
+Required: sender_pseudo, t_curr, label (0 = benign, 1 = attack)
 
-## Abstract
-This repository accompanies the study **“Trust-Gated Hybrid Intrusion Detection for VANETs: Lightweight OBU Screening with RSU Supervised Fusion.”** We present an end-to-end RSU-side intrusion detection and trust gating pipeline combining physics/protocol consistency checks, short-window temporal feature engineering, calibrated gradient boosting for binary screening, optional family-specific heads (including a BiLSTM replay/stale detector), and a logistic meta-learner. An adaptive, per-sender decision threshold is derived from a Beta-trust model to modulate sensitivity under varying evidence. A PyQt5 GUI is included for dataset selection, training, and evaluation (AUC, PR curves, confusion matrices).
 
----
+Recommended: x_curr, y_curr, speed_curr, acc_curr, heading_curr, dt, dist, mb_version, scenario_id, attack_id
+Missing fields are imputed safely; richer fields enable stronger temporal and kinematic features.
 
-## Data Availability
-**Dataset DOI/URL:** **[INSERT YOUR DATASET LINK OR DOI HERE]**  
-*(Replace this placeholder with your actual dataset link, e.g., Zenodo/Kaggle/OSF DOI.)*
 
-**Expected CSV schema**
-- Required: `sender_pseudo`, `t_curr`, `label` (0=normal, 1=attack)
-- Optional but recommended: `x_curr`, `y_curr`, `speed_curr`, `acc_curr`, `heading_curr`, `dt`, `dist`, `mb_version`, `scenario_id`, `attack_id`  
-Missing fields are safely imputed; additional fields enable stronger features.
 
----
+Software Artifact
+Single-file implementation: rsu_trainer_gui_v7.py
+Core modules
 
-## Software Artifact
-Single file implementation: `rsu_trainer_gui_v7.py`  
-Key components:
-- **Quick checks & trust evidence:** physics/protocol flags and anomaly counters.
-- **Temporal features:** short rolling windows per sender (rates, CUSUM, dead-reckoning residuals, freeze ratios, circular variance).
-- **Base detector:** LightGBM with isotonic calibration.
-- **Family heads (optional):** `pos_speed`, `replay_stale` (BiLSTM), `dos` (+IsolationForest anomaly channel), `sybil`, `disruptive`.
-- **Stacking:** logistic meta-learner over base and heads.
-- **Trust gating:** Beta-trust adaptive threshold per sender.
-- **GUI:** PyQt5 interface for training and metrics visualization.
 
----
+Plausibility & trust evidence: physics/protocol checks and rolling anomaly counters.
 
-## Installation
+
+Temporal features: short rolling windows per sender (rates, CUSUM, dead-reckoning residuals, freeze ratios, circular variance).
+
+
+Base screener: LightGBM with isotonic calibration.
+
+
+Family-specific heads (optional): pos_speed, replay_stale (BiLSTM), dos (+IsolationForest anomaly channel), sybil, disruptive.
+
+
+Decision fusion: logistic meta-learner stacking base and heads.
+
+
+Trust gating: Beta-trust process to adjust the per-sender decision threshold.
+
+
+GUI: PyQt5 interface for dataset selection, training, and metric visualization.
+
+
+
+Installation
 Python 3.9+ is recommended.
-```bash
 pip install numpy pandas scikit-learn lightgbm "tensorflow~=2.15.0" pyqt5 matplotlib
+
+Run
+python rsu_trainer_gui_v7.py
+
+Notes
+
+
+GPU support for TensorFlow is optional and not required unless training the BiLSTM head at scale.
+
+
+If your dataset columns differ, use the GUI mapping dialog or adapt the loader section inside rsu_trainer_gui_v7.py.
+
+
+
+Citation
+If you build on this work, please cite the study and this repository. A BibTeX entry will be added once the public DOI is finalized.
