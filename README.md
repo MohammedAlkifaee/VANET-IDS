@@ -1,8 +1,12 @@
 Trust-Gated Hybrid VANET IDS
 Lightweight OBU Screening with RSU-Supervised Evidence Fusion (v7)
+
 Authors
+
 Mohammad Abbas Alkifaee¹ (ORCID: 0009-0004-3731-0886)
+
 Supervisor: Dr. Fahad Ghalib Abdulkadhim² (ORCID: 0000-0002-4922-0878)
+
 Department of Computer Science and Mathematics, University of Kufa, Najaf, Iraq
 
 Abstract
