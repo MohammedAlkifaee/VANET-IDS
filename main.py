@@ -1,1001 +1,1104 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+import os
+import json
+import math
+import sys
+import time
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Any
+import joblib
+from collections import deque
+from pathlib import Path
+from typing import Dict, Any, List, Set
+from PyQt5.QtCore import Qt, QTimer, QRectF
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QLabel, QTextEdit, QSplitter, QHeaderView, QGraphicsView, QGraphicsScene, QGraphicsEllipseItem
+from PyQt5.QtGui import QBrush, QColor, QPainter, QPixmap, QPen
+import pyqtgraph as pg
+ROOT_DIR = Path('/home/instantf2md/F2MD/f2md-results/LuSTNanoScenario-ITSG5')
+MAP_BACKGROUND_IMAGE = Path('/home/instantf2md/Desktop/VANET-IRAQ Live IDS Dashboard/BG.png')
+MODEL_DIR = Path('/home/instantf2md/Desktop/model/')
+MAP_ROT_DEG = 0.0
+MAP_EXTRA_SCALE = 1.0
+MAP_OFFSET_X = 0.0
+MAP_OFFSET_Y = 0.0
+SCAN_INTERVAL_MS = 500
+MAX_MESSAGES = 4000
+ANALYTICS_WINDOW_SECS = 60
+WINDOW_SIZE = 25
+EPS = 1e-06
+pg.setConfigOptions(antialias=True)
 
-from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_curve
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import IsolationForest
-import lightgbm as lgb
+def ang_norm(d: float) -> float:
+    while d > math.pi:
+        d -= 2 * math.pi
+    while d < -math.pi:
+        d += 2 * math.pi
+    return d
 
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional, LayerNormalization
-from tensorflow.keras.callbacks import EarlyStopping
+def mag(x: float, y: float) -> float:
+    return math.hypot(x, y)
 
-np.random.seed(42)
-tf.random.set_seed(42)
+def heading_angle(hvec) -> float:
+    if not isinstance(hvec, list) or len(hvec) < 2:
+        return 0.0
+    return math.atan2(hvec[1], hvec[0])
 
-eps_small = 1e-6
-eps = 1e-6
+def safe_get(v, i, default=0.0) -> float:
+    try:
+        return float(v[i])
+    except Exception:
+        return float(default)
 
-ATTACK_FAMILIES = {
-    "pos_speed": {1, 2, 3, 4, 6, 7, 9},
-    "replay_stale": {11, 12},
-    "dos": {13, 14, 15},
-    "sybil": {16, 18, 19},
-    "disruptive": {10},
-}
-ALL_FAMILIES = list(ATTACK_FAMILIES.keys())
+def parse_bsm_file(path: Path) -> Dict[str, Any]:
+    with open(path, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    bp = obj.get('BsmPrint', {})
+    meta = bp.get('Metadata', {})
+    bsms = bp.get('BSMs', []) or []
+    if not bsms:
+        raise ValueError('no BSMs in file')
+    b = bsms[0]
+    recv = meta.get('receiverPseudo')
+    genT = meta.get('generationTime')
+    attack_meta = meta.get('attackType', meta.get('mbType', 'Genuine'))
+    sender = b.get('Pseudonym') or b.get('RealId')
+    if sender is None or recv is None:
+        raise ValueError('missing sender/receiver')
+    t = float(b.get('CreationTime', 0.0))
+    pos = b.get('Pos', [0, 0, 0])
+    x, y = (safe_get(pos, 0), safe_get(pos, 1))
+    spd = b.get('Speed', [0, 0, 0])
+    vx, vy = (safe_get(spd, 0), safe_get(spd, 1))
+    acc = b.get('Accel', [0, 0, 0])
+    ax, ay = (safe_get(acc, 0), safe_get(acc, 1))
+    hd = b.get('Heading', [1, 0, 0])
+    ang = heading_angle(hd)
+    pc = b.get('PosConfidence', [0, 0, 0])
+    pcx, pcy = (safe_get(pc, 0), safe_get(pc, 1))
+    sc = b.get('SpeedConfidence', [0, 0, 0])
+    scx, scy = (safe_get(sc, 0), safe_get(sc, 1))
+    ac = b.get('AccelConfidence', [0, 0, 0])
+    acx, acy = (safe_get(ac, 0), safe_get(ac, 1))
+    hc = b.get('HeadingConfidence', [0, 0, 0])
+    hcx, hcy = (safe_get(hc, 0), safe_get(hc, 1))
+    label = 0 if b.get('AttackType', 'Genuine') == 'Genuine' and (attack_meta or 'Genuine') == 'Genuine' else 1
+    rec = dict(file_path=str(path), receiver_pseudo=int(recv), sender_pseudo=int(sender), creation_time=t, x=x, y=y, vx=vx, vy=vy, ax=ax, ay=ay, heading=ang, pos_conf_x=pcx, pos_conf_y=pcy, spd_conf_x=scx, spd_conf_y=scy, acc_conf_x=acx, acc_conf_y=acy, head_conf_x=hcx, head_conf_y=hcy, label=int(label), attack_type=b.get('AttackType', 'Genuine'), meta_attack_type=attack_meta, meta_generation_time=genT if genT is not None else t)
+    return rec
 
-def quick_checks_add_evidence_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    def S(name: str, default: float = 0.0) -> pd.Series:
-        if name in out.columns:
-            return pd.to_numeric(out[name], errors="coerce").fillna(0.0)
-        else:
-            return pd.Series(default, index=out.index, dtype=float)
-    speed = S("speed_curr")
-    acc = S("acc_curr")
-    hr = S("heading_rate")
-    dt = S("dt")
-    dist = S("dist")
-    out["flag_speed_phys"] = (speed > 80.0).astype(int)
-    out["flag_acc_phys"] = (acc.abs() > 12.0).astype(int)
-    out["flag_hr_phys"] = (hr.abs() > 2.0).astype(int)
-    consistency = (dist - speed * dt).abs()
-    out["consistency_err"] = consistency
-    out["flag_consistency"] = (consistency > np.maximum(1.0, 0.25 * speed * dt)).astype(int)
-    cols_to_check = [c for c in ["dt", "speed_curr", "acc_curr", "heading_curr"] if c in out.columns]
-    if cols_to_check:
-        out["flag_proto_nan"] = out[cols_to_check].replace([np.inf, -np.inf], np.nan).isna().any(axis=1).astype(int)
-    else:
-        out["flag_proto_nan"] = 0
-    out["flag_dt_nonpos"] = (dt <= 0).astype(int)
-    proto_cols = ["flag_proto_nan", "flag_dt_nonpos"]
-    out["proto_anom_count"] = out[proto_cols].sum(axis=1)
-    return out
+class IDSModel:
 
-def feature_engineering(df: pd.DataFrame, sender_col: str = "sender_pseudo", time_col: str = "t_curr", window_size: int = 15, eps: float = 1e-6) -> pd.DataFrame:
-    df = df.copy()
-    def S(name: str, default: float = 0.0) -> pd.Series:
-        if name in df.columns:
-            return pd.to_numeric(df[name], errors="coerce").fillna(default)
-        return pd.Series(default, index=df.index, dtype=float)
-    tcol = time_col if time_col in df.columns else ("time" if "time" in df.columns else time_col)
-    df = df.sort_values([sender_col, tcol]).reset_index(drop=True)
-    g = df.groupby(sender_col, sort=False)
-    if "dt" not in df.columns:
-        df["dt"] = g[tcol].diff().fillna(0.0)
-    df["dt"] = pd.to_numeric(df["dt"], errors="coerce").fillna(0.0)
-    has_xy = {"x_curr", "y_curr"}.issubset(df.columns)
-    if has_xy:
-        df["dx"] = g["x_curr"].diff().fillna(0.0)
-        df["dy"] = g["y_curr"].diff().fillna(0.0)
-        df["dist"] = np.hypot(pd.to_numeric(df["dx"], errors="coerce").fillna(0.0), pd.to_numeric(df["dy"], errors="coerce").fillna(0.0))
-    else:
-        df["dx"] = S("dx", 0.0)
-        df["dy"] = S("dy", 0.0)
-        df["dist"] = S("dist", 0.0)
-    if "speed_curr" not in df.columns:
-        df["speed_curr"] = df["dist"] / np.clip(df["dt"], eps, None)
-    else:
-        df["speed_curr"] = pd.to_numeric(df["speed_curr"], errors="coerce").fillna(0.0)
-    df["speed_prev"] = g["speed_curr"].shift(1).fillna(df["speed_curr"])
-    df["dv"] = df["speed_curr"] - df["speed_prev"]
-    df["acc_curr"] = df["dv"] / np.clip(df["dt"], eps, None)
-    df["acc_prev"] = g["acc_curr"].shift(1).fillna(df["acc_curr"])
-    df["dacc_jerk"] = (df["acc_curr"] - df["acc_prev"]) / np.clip(df["dt"], eps, None)
-    df["neg_acc_flag"] = (df["acc_curr"] < -0.30).astype(int)
-    df["low_speed_flag"] = (df["speed_curr"] < 0.50).astype(int)
-    df[f"neg_acc_ratio_w{window_size}"] = g["neg_acc_flag"].rolling(window=window_size, min_periods=2).mean().reset_index(level=0, drop=True)
-    df[f"low_speed_ratio_w{window_size}"] = g["low_speed_flag"].rolling(window=window_size, min_periods=2).mean().reset_index(level=0, drop=True)
-    if "heading_curr" not in df.columns:
-        df["heading_curr"] = 0.0
-    else:
-        df["heading_curr"] = pd.to_numeric(df["heading_curr"], errors="coerce").fillna(0.0)
-    df["heading_prev"] = g["heading_curr"].shift(1).fillna(df["heading_curr"])
-    df["dtheta"] = df["heading_curr"] - df["heading_prev"]
-    df["heading_rate"] = df["dtheta"] / np.clip(df["dt"], eps, None)
-    df["dr_dx"] = 0.0
-    df["dr_dy"] = 0.0
-    if has_xy:
-        x_prev = g["x_curr"].shift(1).fillna(df["x_curr"])
-        y_prev = g["y_curr"].shift(1).fillna(df["y_curr"])
-        cosh = np.cos(df["heading_prev"].fillna(0.0))
-        sinh = np.sin(df["heading_prev"].fillna(0.0))
-        vx = df["speed_prev"] * cosh
-        vy = df["speed_prev"] * sinh
-        x_pred = x_prev + vx * df["dt"]
-        y_pred = y_prev + vy * df["dt"]
-        df["dr_dx"] = df["x_curr"] - x_pred
-        df["dr_dy"] = df["y_curr"] - y_pred
-    df["dr_angle"] = np.arctan2(df["dr_dy"], df["dr_dx"])
-    df["sin_a"] = np.sin(df["dr_angle"])
-    df["cos_a"] = np.cos(df["dr_angle"])
-    msin = g["sin_a"].rolling(window=window_size, min_periods=2).mean().reset_index(level=0, drop=True)
-    mcos = g["cos_a"].rolling(window=window_size, min_periods=2).mean().reset_index(level=0, drop=True)
-    df[f"dr_angle_var_w{window_size}"] = 1.0 - np.sqrt(mcos**2 + msin**2)
-    eff = int(window_size) - 1 if int(window_size) > 1 else 1
-    span_series = g[tcol].transform(lambda s: s - s.shift(eff))
-    df["rate_msgs_per_s"] = eff / np.clip(span_series.astype(float), 1e-6, None)
-    df["rate_msgs_per_s"] = g["rate_msgs_per_s"].transform(lambda s: s.bfill().ffill())
-    df["rate_ewma"] = g["rate_msgs_per_s"].transform(lambda s: s.ewm(span=window_size, adjust=False).mean())
-    r = df["rate_msgs_per_s"] - df["rate_ewma"]
-    df["rate_cusum_pos"] = g.apply(lambda x: np.maximum.accumulate(np.maximum(0, r.loc[x.index].cumsum()))).reset_index(level=0, drop=True)
-    df["rate_cusum_neg"] = g.apply(lambda x: np.maximum.accumulate(np.maximum(0, (-r.loc[x.index]).cumsum()))).reset_index(level=0, drop=True)
-    roll_cols = ["dv", "dacc_jerk", "heading_rate", "dist", "dt"]
-    existing_roll = [c for c in roll_cols if c in df.columns]
-    if existing_roll:
-        stats = g[existing_roll].rolling(window=window_size, min_periods=2).agg(["mean", "std", "max"])
-        stats.columns = [f"{c}_{s}_w{window_size}" for c, s in stats.columns]
-        df = pd.concat([df, stats.reset_index(level=0, drop=True)], axis=1)
-    df[f"dt_jitter_w{window_size}"] = g["dt"].rolling(window=window_size, min_periods=2).std().reset_index(level=0, drop=True)
-    def _freeze_ratio(series: pd.Series, thr: float) -> pd.Series:
-        def _roll_mean_small(s: pd.Series) -> pd.Series:
-            return (s.abs() < thr).rolling(window=window_size, min_periods=2).mean()
-        out = g.apply(lambda x: _roll_mean_small(series.loc[x.index]))
-        return out.reset_index(level=0, drop=True)
-    df[f"freeze_ratio_dv_w{window_size}"] = _freeze_ratio(df["dv"], 1e-4)
-    df[f"freeze_ratio_dist_w{window_size}"] = _freeze_ratio(df["dist"], 1e-3)
-    df[f"freeze_ratio_hr_w{window_size}"] = _freeze_ratio(df["heading_rate"], 1e-4)
-    df["consistency_err"] = (df["dist"] - df["speed_curr"] * df["dt"]).abs()
-    df[f"consistency_err_mean_w{window_size}"] = g["consistency_err"].rolling(window=window_size, min_periods=2).mean().reset_index(level=0, drop=True)
-    def _state_hash(row):
-        return (round(float(row.get("x_curr", 0.0)), 3), round(float(row.get("y_curr", 0.0)), 3), round(float(row.get("speed_curr", 0.0)), 2), round(float(row.get("heading_curr", 0.0)), 2))
-    df["state_hash"] = df.apply(_state_hash, axis=1)
-    df["state_code"] = g["state_hash"].transform(lambda s: pd.factorize(s)[0].astype("int64"))
-    def _dup_ratio_np(w):
-        w = w.astype("int64", copy=False)
-        return 1.0 - (np.unique(w).size / max(1, w.size))
-    df["state_dup_ratio_w"] = g["state_code"].transform(lambda s: s.rolling(window=window_size, min_periods=2).apply(_dup_ratio_np, raw=True))
-    med_dt = g["dt"].transform(lambda s: s.rolling(window=window_size, min_periods=2).median())
-    mad_dt = g["dt"].transform(lambda s: s.rolling(window=window_size, min_periods=2).apply(lambda w: np.median(np.abs(w - np.median(w))) if len(w) else 0.0, raw=True) + 1e-6)
-    df["dt_z"] = (df["dt"] - med_dt) / mad_dt
-    mu_dt = g["dt"].transform(lambda s: s.rolling(window=window_size, min_periods=2).mean())
-    sd_dt = g["dt"].transform(lambda s: s.rolling(window=window_size, min_periods=2).std())
-    df["dt_cv_w"] = sd_dt / (mu_dt + 1e-6)
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(inplace=True)
-    return df
+    def __init__(self, model_dir: Path):
+        self.model_dir = Path(model_dir)
+        self.preproc = joblib.load(self.model_dir / 'preproc.joblib')
+        self.bin_calib = joblib.load(self.model_dir / 'bin_calib.joblib')
+        self.family_head = joblib.load(self.model_dir / 'head_pos_speed.joblib')
+        self.meta_model = joblib.load(self.model_dir / 'meta.joblib')
+        with open(self.model_dir / 'model_meta.json', 'r', encoding='utf-8') as f:
+            self.meta_info = json.load(f)
+        self.tfm = self.preproc['tfm']
+        self.scaler = self.preproc['scaler']
+        self.X_cols = self.preproc['X_cols_final']
 
-def build_lstm(input_shape):
-    model = Sequential([
-        Bidirectional(LSTM(64, return_sequences=True, activation='tanh'), input_shape=input_shape),
-        LayerNormalization(),
-        Dropout(0.2),
-        Bidirectional(LSTM(64, activation='tanh')),
-        LayerNormalization(),
-        Dropout(0.2),
-        Dense(32, activation='relu'),
-        Dense(1, activation='sigmoid'),
-    ])
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['AUC'])
-    return model
-
-def make_sequences_per_sender(X_df: pd.DataFrame, y: pd.Series, groups: pd.Series, seq_len=20):
-    feats = X_df.columns.tolist()
-    Xs, ys, gs, idx_last = [], [], [], []
-    for sid, idxs in X_df.groupby(groups, sort=False).groups.items():
-        idxs = np.array(sorted(list(idxs)))
-        Xi = X_df.loc[idxs, feats].values
-        yi = y.loc[idxs].values
-        if len(Xi) < seq_len:
-            continue
-        for s in range(0, len(Xi) - seq_len + 1):
-            e = s + seq_len
-            Xs.append(Xi[s:e])
-            ys.append(yi[e - 1])
-            gs.append(sid)
-            idx_last.append(idxs[e - 1])
-    if not Xs:
-        return np.zeros((0, seq_len, len(feats))), np.zeros((0,)), np.array([]), np.array([])
-    return np.stack(Xs), np.array(ys), np.array(gs), np.array(idx_last)
-
-class TrustManager:
-    def __init__(self, alpha0=1.0, beta0=1.0):
-        self.map: Dict[str, Tuple[float, float]] = {}
-        self.alpha0, self.beta0 = alpha0, beta0
-    def _get(self, sid):
-        return self.map.get(sid, (self.alpha0, self.beta0))
-    def update(self, sid, is_malicious: bool, w: float = 1.0):
-        a, b = self._get(sid)
-        if is_malicious:
-            b += w
-        else:
-            a += w
-        self.map[sid] = (a, b)
-    def trust(self, sid) -> float:
-        a, b = self._get(sid)
-        return a / (a + b)
-    def from_quick_evidence(self, row, w=0.5) -> Tuple[float, float]:
-        reward = 0.0
-        penal = 0.0
-        for c in ["flag_speed_phys", "flag_acc_phys", "flag_hr_phys", "flag_consistency", "flag_proto_nan", "flag_dt_nonpos"]:
-            if c in row and row[c] == 1:
-                penal += w
-        if penal == 0.0:
-            reward += 0.25 * w
-        return reward, penal
-    def adaptive_threshold(self, sid, base_thr=0.5, sensitivity=0.55, floor=0.35, ceil=0.85):
-        t = self.trust(sid)
-        adj = sensitivity * (t - 0.5) * 2.0
-        thr = float(np.clip(base_thr + adj, floor, ceil))
-        return thr
-
-class RSUTrainer:
-    def __init__(self, train_family: str = "binary", seq_len: int = 20, window_size: int = 25):
-        assert train_family in {"binary", "pos_speed", "replay_stale", "dos", "sybil", "disruptive", "all"}
-        self.train_family = train_family
-        self.seq_len = seq_len
-        self.window_size = int(window_size)
-        self.scaler = StandardScaler()
-        self.bin_clf = lgb.LGBMClassifier(objective='binary', class_weight='balanced', n_estimators=800, learning_rate=0.03, num_leaves=192, min_data_in_leaf=20, feature_fraction=0.85, random_state=42, min_gain_to_split=1e-12, verbosity=-1)
-        self.bin_calib: Optional[CalibratedClassifierCV] = None
-        self.head_pos: Optional[lgb.LGBMClassifier] = None
-        self.head_pos_calib: Optional[CalibratedClassifierCV] = None
-        self.head_dos: Optional[lgb.LGBMClassifier] = None
-        self.head_dos_calib: Optional[CalibratedClassifierCV] = None
-        self.iforest = IsolationForest(n_estimators=300, contamination=0.02, random_state=42)
-        self.if_min, self.if_max = 0.0, 1.0
-        self.head_sybil: Optional[lgb.LGBMClassifier] = None
-        self.head_sybil_calib: Optional[CalibratedClassifierCV] = None
-        self.head_disr: Optional[lgb.LGBMClassifier] = None
-        self.head_disr_calib: Optional[CalibratedClassifierCV] = None
-        self.lstm: Optional[tf.keras.Model] = None
-        self.lstm_shape: Optional[Tuple[int, int]] = None
-        self.meta = LogisticRegression(class_weight='balanced', max_iter=300, random_state=42)
-        self.sender_col = "sender_pseudo"
-        self.time_col = "t_curr"
-        self.label_col = "label"
-        self.attack_col = "attack_id"
-        self.best_threshold: float = 0.5
-
-    @staticmethod
-    def _family_from_ids(ids: List[int]) -> Optional[str]:
-        present = set(ids)
-        for fam, s in ATTACK_FAMILIES.items():
-            if present & s:
-                return fam
-        return None
-
-    @staticmethod
-    def _build_family_labels(df: pd.DataFrame, fam: str) -> pd.Series:
-        if "attack_id" not in df.columns:
-            return pd.Series(np.zeros(len(df), dtype=int), index=df.index)
-        ids = pd.to_numeric(df["attack_id"], errors="coerce").fillna(-1).astype(int)
-        return ids.isin(ATTACK_FAMILIES[fam]).astype(int)
-
-    def _dos_features_cols(self, Xcols: List[str]) -> List[str]:
-        return [c for c in Xcols if c.startswith("rate_") or c.startswith("dt_jitter") or c.endswith("_dt")]
-
-    def _sybil_features_cols(self, df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        out["window_id"] = (out[self.time_col] // 5).astype(int)
-        grp = out.groupby("window_id")
-        out["sybil_unique_ids_5s"] = grp[self.sender_col].transform("nunique")
-        win_entropy = grp[self.sender_col].apply(lambda s: -(s.value_counts(normalize=True).apply(lambda p: p * np.log(p + 1e-9))).sum())
-        out["sybil_sender_entropy_5s"] = out["window_id"].map(win_entropy)
-        win_sets = grp[self.sender_col].apply(lambda s: set(s.values))
-        jacc = win_sets.index.to_series().map(lambda w: (len(win_sets.get(w, set()) & win_sets.get(w - 1, set())) / max(1, len(win_sets.get(w, set()) | win_sets.get(w - 1, set()))))).fillna(0.0)
-        out["sybil_jaccard_ids_5s"] = out["window_id"].map(jacc)
-        first_win = out.groupby(self.sender_col)["window_id"].transform("min")
-        out["sybil_new_id_flag"] = (out["window_id"] == first_win).astype(int)
-        rate_by_win = grp["sybil_new_id_flag"].mean()
-        ewma = rate_by_win.ewm(span=8, adjust=False).mean()
-        z_like = (rate_by_win - ewma).fillna(0.0)
-        out["sybil_new_ids_rate"] = out["window_id"].map(rate_by_win)
-        out["sybil_new_ids_burst"] = out["window_id"].map(z_like)
-        out.drop(columns=["sybil_new_id_flag"], inplace=True, errors="ignore")
-        return out
-
-    def _prepare(self, df_raw: pd.DataFrame) -> pd.DataFrame:
-        d0 = quick_checks_add_evidence_features(df_raw)
-        d1 = feature_engineering(d0, sender_col=self.sender_col, time_col=self.time_col, window_size=self.window_size)
-        d2 = self._sybil_features_cols(d1)
-        return d2
-
-    def _fit_binary(self, Xs: np.ndarray, y: pd.Series):
-        self.bin_calib = CalibratedClassifierCV(self.bin_clf, method='isotonic', cv=5)
-        self.bin_calib.fit(Xs, y)
-
-    def _fit_pos_head(self, Xs: np.ndarray, y_fam: pd.Series):
-        self.head_pos = lgb.LGBMClassifier(objective='binary', class_weight='balanced', n_estimators=800, learning_rate=0.05, num_leaves=128, min_data_in_leaf=40, feature_fraction=0.9, random_state=42, min_gain_to_split=1e-12, verbosity=-1)
-        self.head_pos_calib = CalibratedClassifierCV(self.head_pos, method='isotonic', cv=5)
-        self.head_pos_calib.fit(Xs, y_fam)
-
-    def _fit_dos_head(self, Xs: np.ndarray, y_fam: pd.Series, dos_cols_mask: np.ndarray):
-        X_dos = Xs[:, dos_cols_mask] if dos_cols_mask.sum() > 0 else Xs
-        self.head_dos = lgb.LGBMClassifier(objective='binary', class_weight='balanced', n_estimators=800, learning_rate=0.05, num_leaves=128, min_data_in_leaf=40, feature_fraction=0.9, random_state=42, min_gain_to_split=1e-12, verbosity=-1)
-        self.head_dos_calib = CalibratedClassifierCV(self.head_dos, method='isotonic', cv=5)
-        self.head_dos_calib.fit(X_dos, y_fam)
-        normal_mask = (y_fam.values == 0)
-        if normal_mask.sum() > 10:
-            self.iforest.fit(X_dos[normal_mask])
-            sco = -self.iforest.score_samples(X_dos)
-            self.if_min, self.if_max = np.percentile(sco, [1, 99])
-            if self.if_max <= self.if_min:
-                self.if_max = self.if_min + 1e-6
-
-    def _fit_sybil_head(self, Xs: np.ndarray, y_fam: pd.Series, X_cols: List[str]):
-        sel = [i for i, c in enumerate(X_cols) if c.startswith("sybil_") or c == "rate_msgs_per_s"]
-        X_sy = Xs[:, sel] if sel else Xs
-        self.head_sybil = lgb.LGBMClassifier(objective='binary', class_weight='balanced', n_estimators=800, learning_rate=0.05, num_leaves=128, min_data_in_leaf=40, feature_fraction=0.9, random_state=42, min_gain_to_split=1e-12, verbosity=-1)
-        self.head_sybil_calib = CalibratedClassifierCV(self.head_sybil, method='isotonic', cv=5)
-        self.head_sybil_calib.fit(X_sy, y_fam)
-
-    def _fit_disr_head(self, Xs: np.ndarray, y_fam: pd.Series, X_cols: List[str]):
-        sel = [i for i, c in enumerate(X_cols) if c.startswith("flag_") or c == "proto_anom_count"]
-        X_di = Xs[:, sel] if sel else Xs
-        self.head_disr = lgb.LGBMClassifier(objective='binary', class_weight='balanced', n_estimators=600, learning_rate=0.05, num_leaves=96, min_data_in_leaf=30, feature_fraction=0.9, random_state=42, min_gain_to_split=1e-12, verbosity=-1)
-        self.head_disr_calib = CalibratedClassifierCV(self.head_disr, method='isotonic', cv=5)
-        self.head_disr_calib.fit(X_di, y_fam)
-
-    def _fit_replay_head(self, X_df_scaled: pd.DataFrame, y: pd.Series, groups: pd.Series):
-        X_seq, y_seq, g_seq, idx_last = make_sequences_per_sender(X_df_scaled, y, groups, seq_len=self.seq_len)
-        if len(X_seq) == 0:
-            self.lstm = None
-            self.lstm_shape = None
-            return np.zeros(len(X_df_scaled)), np.array([], dtype=int)
-        self.lstm_shape = (X_seq.shape[1], X_seq.shape[2])
-        pos = float(y_seq.mean() + 1e-9)
-        class_weight = {0: 1.0, 1: max(1.0, (1.0 - pos) / pos)}
-        oof = pd.Series(0.0, index=X_df_scaled.index, dtype=float)
-        gkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
-        for tr, va in gkf.split(X_seq, y_seq, g_seq):
-            m = build_lstm(self.lstm_shape)
-            es = EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True)
-            m.fit(X_seq[tr], y_seq[tr], epochs=40, batch_size=256, validation_data=(X_seq[va], y_seq[va]), callbacks=[es], verbose=0, class_weight=class_weight)
-            p = m.predict(X_seq[va], verbose=0).ravel()
-            oof.loc[idx_last[va]] = p
-        self.lstm = build_lstm(self.lstm_shape)
-        es = EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True)
-        self.lstm.fit(X_seq, y_seq, epochs=40, batch_size=256, validation_split=0.2, callbacks=[es], verbose=0, class_weight=class_weight)
-        oof_sm = oof.copy()
-        for sid, idxs in X_df_scaled.groupby(groups, sort=False).groups.items():
-            idxs = list(sorted(list(idxs)))
-            vals = oof_sm.loc[idxs].values
-            if len(vals) >= 3:
-                vals = pd.Series(vals).ewm(alpha=0.3, adjust=False).mean().values
-            oof_sm.loc[idxs] = vals
-        return oof_sm.values, idx_last
-
-    def fit_evaluate(self, df_raw: pd.DataFrame) -> Dict:
-        df = self._prepare(df_raw)
-        drop_cols = [self.sender_col, self.time_col, self.label_col, self.attack_col]
-        X_cols = [c for c in df.columns if c not in drop_cols]
-        y_bin = df[self.label_col].astype(int) if self.label_col in df.columns else pd.Series(np.zeros(len(df), dtype=int), index=df.index)
-        groups = df[self.sender_col]
-        fam = self.train_family
-        if fam not in {"binary", "all"} and self.attack_col in df.columns:
-            present_ids = pd.to_numeric(df[self.attack_col], errors="coerce").dropna().astype(int).unique().tolist()
-            self._family_from_ids(present_ids)
-        gkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
-        tr_idx, te_idx = next(gkf.split(df, y_bin, groups))
-        train_df, test_df = df.iloc[tr_idx], df.iloc[te_idx]
-        X_train = train_df[X_cols]
-        X_test = test_df[X_cols]
-        y_train_bin = y_bin.iloc[tr_idx]
-        y_test_bin = y_bin.iloc[te_idx]
-        groups_train = groups.iloc[tr_idx]
-        groups_test = groups.iloc[te_idx]
-        X_train_s = self.scaler.fit_transform(X_train)
-        X_test_s = self.scaler.transform(X_test)
-        self._fit_binary(X_train_s, y_train_bin)
-        p_bin_train = self.bin_calib.predict_proba(X_train_s)[:, 1]
-        p_bin_test = self.bin_calib.predict_proba(X_test_s)[:, 1]
-        family_probs_train: Dict[str, np.ndarray] = {}
-        family_probs_test: Dict[str, np.ndarray] = {}
-        fams_to_train = ALL_FAMILIES if self.train_family == "all" else ([] if self.train_family == "binary" else [self.train_family])
-        dos_mask = np.array([c in self._dos_features_cols(X_cols) for c in X_cols])
-        X_train_df_s = pd.DataFrame(X_train_s, index=X_train.index, columns=X_cols)
-        X_test_df_s = pd.DataFrame(X_test_s, index=X_test.index, columns=X_cols)
-        for fam_name in fams_to_train:
-            y_fam = self._build_family_labels(train_df, fam_name)
-            y_fam_test = self._build_family_labels(test_df, fam_name)
-            if fam_name == "pos_speed":
-                self._fit_pos_head(X_train_s, y_fam)
-                family_probs_train[fam_name] = self.head_pos_calib.predict_proba(X_train_s)[:, 1]
-                family_probs_test[fam_name] = self.head_pos_calib.predict_proba(X_test_s)[:, 1]
-            elif fam_name == "replay_stale":
-                oof_train, idx_last = self._fit_replay_head(X_train_df_s, y_fam, groups_train)
-                family_probs_train[fam_name] = oof_train
-                if self.lstm is not None:
-                    X_seq_t, y_seq_t, g_seq_t, idx_last_t = make_sequences_per_sender(X_test_df_s, y_fam_test, groups_test, seq_len=self.seq_len)
-                    p_t = np.zeros(len(X_test_df_s))
-                    if len(X_seq_t) > 0:
-                        p_seq = self.lstm.predict(X_seq_t, verbose=0).ravel()
-                        p_t[idx_last_t] = p_seq
-                    family_probs_test[fam_name] = p_t
-                else:
-                    family_probs_test[fam_name] = np.zeros(len(X_test_df_s))
-            elif fam_name == "dos":
-                self._fit_dos_head(X_train_s, y_fam, dos_mask)
-                Xtr_d = X_train_s[:, dos_mask] if dos_mask.sum() > 0 else X_train_s
-                Xte_d = X_test_s[:, dos_mask] if dos_mask.sum() > 0 else X_test_s
-                family_probs_train[fam_name] = self.head_dos_calib.predict_proba(Xtr_d)[:, 1]
-                family_probs_test[fam_name] = self.head_dos_calib.predict_proba(Xte_d)[:, 1]
-                sco_tr = -self.iforest.score_samples(Xtr_d)
-                sco_te = -self.iforest.score_samples(Xte_d)
-                def norm(s):
-                    return np.clip((s - self.if_min) / (self.if_max - self.if_min + 1e-9), 0, 1)
-                family_probs_train["dos_iforest"] = norm(sco_tr)
-                family_probs_test["dos_iforest"] = norm(sco_te)
-            elif fam_name == "sybil":
-                self._fit_sybil_head(X_train_s, y_fam, X_cols)
-                sel = [i for i, c in enumerate(X_cols) if c.startswith("sybil_") or c == "rate_msgs_per_s"]
-                Xtr = X_train_s[:, sel] if sel else X_train_s
-                Xte = X_test_s[:, sel] if sel else X_test_s
-                family_probs_train[fam_name] = self.head_sybil_calib.predict_proba(Xtr)[:, 1]
-                family_probs_test[fam_name] = self.head_sybil_calib.predict_proba(Xte)[:, 1]
-            elif fam_name == "disruptive":
-                self._fit_disr_head(X_train_s, y_fam, X_cols)
-                sel = [i for i, c in enumerate(X_cols) if c.startswith("flag_") or c == "proto_anom_count"]
-                Xtr = X_train_s[:, sel] if sel else X_train_s
-                Xte = X_test_s[:, sel] if sel else X_test_s
-                family_probs_train[fam_name] = self.head_disr_calib.predict_proba(Xtr)[:, 1]
-                family_probs_test[fam_name] = self.head_disr_calib.predict_proba(Xte)[:, 1]
-        def stack_build(pbin, fam_probs: Dict[str, np.ndarray]) -> np.ndarray:
-            feats = [pbin]
-            for k in ["pos_speed", "replay_stale", "dos", "sybil", "disruptive", "dos_iforest"]:
-                if k in fam_probs:
-                    feats.append(fam_probs[k])
-            return np.vstack(feats).T
-        meta_X_tr = stack_build(p_bin_train, family_probs_train)
-        meta_X_te = stack_build(p_bin_test, family_probs_test)
-        self.meta.fit(meta_X_tr, y_train_bin)
-        p_final = self.meta.predict_proba(meta_X_te)[:, 1]
-        prec, rec, th = precision_recall_curve(y_test_bin, p_final)
-        f1 = (2 * prec * rec) / (prec + rec + 1e-9)
-        best_thr = th[np.nanargmax(f1)] if len(th) > 0 else 0.5
-        self.best_threshold = float(best_thr)
-        y_pred_fixed = (p_final >= self.best_threshold).astype(int)
-        report = {
-            "best_threshold": float(self.best_threshold),
-            "confusion_matrix_fixed": confusion_matrix(y_test_bin, y_pred_fixed),
-            "cls_report_fixed": classification_report(y_test_bin, y_pred_fixed, digits=4, output_dict=True),
-        }
-        try:
-            report["roc_auc"] = float(roc_auc_score(y_test_bin, p_final))
-        except Exception:
-            report["roc_auc"] = None
-        tm = TrustManager()
-        test_df_loc = test_df.copy()
-        test_df_loc["p_final"] = p_final
-        test_df_loc = test_df_loc.sort_values([self.sender_col, self.time_col])
-        y_pred_adapt = []
-        for _, row in test_df_loc.iterrows():
-            rwd, pnl = tm.from_quick_evidence(row)
-            sid = row[self.sender_col]
-            if pnl > 0:
-                tm.update(sid, True, pnl)
-            elif rwd > 0:
-                tm.update(sid, False, rwd)
-            thr = tm.adaptive_threshold(sid, base_thr=self.best_threshold, sensitivity=0.4)
-            dec = int(row["p_final"] >= thr)
-            y_pred_adapt.append(dec)
-            tm.update(sid, bool(dec), 1.0)
-        report["confusion_matrix_adaptive"] = confusion_matrix(y_test_bin.values, y_pred_adapt)
-        report["cls_report_adaptive"] = classification_report(y_test_bin.values, y_pred_adapt, digits=4, output_dict=True)
-        sample = list(groups_test.unique())[:5]
-        report["sample_trust"] = {sid: round(tm.trust(sid), 3) for sid in sample}
-        report["used_families"] = fams_to_train
-        prec2, rec2, _ = precision_recall_curve(y_test_bin, p_final)
-        report["pr_curve"] = {"precision": prec2.tolist(), "recall": rec2.tolist()}
-        return report
-
-    def infer(self, df_new: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        df = self._prepare(df_new)
-        X_cols = [c for c in df.columns if c not in [self.sender_col, self.time_col, self.label_col, self.attack_col]]
-        Xs = self.scaler.transform(df[X_cols])
-        p_bin = self.bin_calib.predict_proba(Xs)[:, 1]
-        fam_probs: Dict[str, np.ndarray] = {}
-        if self.head_pos_calib is not None:
-            fam_probs["pos_speed"] = self.head_pos_calib.predict_proba(Xs)[:, 1]
-        if self.lstm is not None:
-            X_df_s = pd.DataFrame(Xs, index=df.index, columns=X_cols)
-            y_dummy = pd.Series(np.zeros(len(df), dtype=int), index=df.index)
-            g = df[self.sender_col]
-            X_seq, y_seq, gs, idx_last = make_sequences_per_sender(X_df_s, y_dummy, g, seq_len=self.seq_len)
-            p_t = np.zeros(len(df))
-            if len(X_seq) > 0:
-                p_seq = self.lstm.predict(X_seq, verbose=0).ravel()
-                p_t[idx_last] = p_seq
-            fam_probs["replay_stale"] = p_t
-        if self.head_dos_calib is not None:
-            dos_mask = np.array([c in self._dos_features_cols(X_cols) for c in X_cols])
-            Xd = Xs[:, dos_mask] if dos_mask.sum() > 0 else Xs
-            fam_probs["dos"] = self.head_dos_calib.predict_proba(Xd)[:, 1]
-            sco = -self.iforest.score_samples(Xd)
-            fam_probs["dos_iforest"] = np.clip((sco - self.if_min) / (self.if_max - self.if_min + 1e-9), 0, 1)
-        if self.head_sybil_calib is not None:
-            sel = [i for i, c in enumerate(X_cols) if c.startswith("sybil_") or c == "rate_msgs_per_s"]
-            Xsy = Xs[:, sel] if sel else Xs
-            fam_probs["sybil"] = self.head_sybil_calib.predict_proba(Xsy)[:, 1]
-        if self.head_disr_calib is not None:
-            sel = [i for i, c in enumerate(X_cols) if c.startswith("flag_") or c == "proto_anom_count"]
-            Xdi = Xs[:, sel] if sel else Xs
-            fam_probs["disruptive"] = self.head_disr_calib.predict_proba(Xdi)[:, 1]
-        def stack_build(pbin, fam_probs):
-            feats = [pbin]
-            for k in ["pos_speed", "replay_stale", "dos", "sybil", "disruptive", "dos_iforest"]:
-                if k in fam_probs:
-                    feats.append(fam_probs[k])
-            return np.vstack(feats).T
-        meta_X = stack_build(p_bin, fam_probs)
-        p_final = self.meta.predict_proba(meta_X)[:, 1]
-        thr = float(self.best_threshold) if hasattr(self, "best_threshold") else 0.5
-        y_pred = (p_final >= thr).astype(int)
-        return p_final, y_pred
-
-import sys, os, json, traceback, warnings
-from PyQt5.QtCore import Qt, QObject, pyqtSignal, QThread
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog, QLineEdit, QComboBox, QPlainTextEdit, QProgressBar, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem, QSizePolicy, QGroupBox, QCheckBox, QDoubleSpinBox
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-class MplCanvas(FigureCanvas):
-    def __init__(self):
-        self.fig = Figure(figsize=(5, 3), dpi=100)
-        super().__init__(self.fig)
-        self.ax = self.fig.add_subplot(111)
-        self.fig.tight_layout()
-
-def _fit_numeric_transformer(df_tr: pd.DataFrame, cols: List[str], cat_col: Optional[str], logfn):
-    Xtr = df_tr[cols].copy()
-    ohe_values = None
-    if cat_col and cat_col in Xtr.columns:
-        ohe_values = Xtr[cat_col].astype(str).value_counts().index.tolist()[:20]
-        for v in ohe_values:
-            Xtr[f"{cat_col}__{v}"] = (Xtr[cat_col].astype(str) == str(v)).astype(int)
-        Xtr = Xtr.drop(columns=[cat_col])
-        logfn(f"[I] One-Hot لعمود {cat_col}: {len(ohe_values)} فئات (حتى 20).")
-    obj_cols = Xtr.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
-    converted = []
-    for c in obj_cols:
-        s = pd.to_numeric(Xtr[c], errors='coerce')
-        if s.notna().mean() >= 0.9:
-            Xtr[c] = s
-            converted.append(c)
-    if converted:
-        logfn(f"[I] تحويل نص→رقم (TRAIN): {converted[:15]}{' ...' if len(converted)>15 else ''}")
-    Xtr = Xtr.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan)
-    Xtr = Xtr.dropna(axis=1, how='all')
-    med = Xtr.median(numeric_only=True)
-    Xtr = Xtr.fillna(med)
-    nun = Xtr.nunique(dropna=False)
-    keep = nun[nun > 1].index.tolist()
-    dropped_const = [c for c in Xtr.columns if c not in keep]
-    if dropped_const:
-        logfn(f"[W] أعمدة ثابتة (TRAIN): {dropped_const[:15]}{' ...' if len(dropped_const)>15 else ''}")
-    return {"keep_cols": keep, "medians": med.to_dict(), "cat_col": cat_col, "ohe_values": ohe_values}
-
-def _apply_numeric_transformer(df: pd.DataFrame, cols: List[str], tfm: dict) -> pd.DataFrame:
-    X = df[cols].copy()
-    cat_col = tfm.get("cat_col")
-    ohe_values = tfm.get("ohe_values")
-    if cat_col and cat_col in X.columns and ohe_values is not None:
-        for v in ohe_values:
-            X[f"{cat_col}__{v}"] = (X[cat_col].astype(str) == str(v)).astype(int)
-        X = X.drop(columns=[cat_col])
-    for c in X.select_dtypes(include=['object', 'string', 'category']).columns.tolist():
-        X[c] = pd.to_numeric(X[c], errors='coerce')
-    X = X.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan)
-    med = tfm["medians"]
-    X = X.fillna({k: v for k, v in med.items() if k in X.columns})
-    keep = [c for c in tfm["keep_cols"] if c in X.columns]
-    X = X.reindex(columns=keep, fill_value=0)
-    return X
-
-class TrainWorker(QObject):
-    log = pyqtSignal(str)
-    stage = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    finished = pyqtSignal(dict)
-    failed = pyqtSignal(str)
-    def __init__(self, csv_path: str, family: str, ohe_version: bool, save_model: bool, model_dir: str, attack_ids: Optional[List[int]], split_mode: str, test_size: float):
-        super().__init__()
-        self.csv_path = csv_path
-        self.family = family
-        self.ohe_version = ohe_version
-        self.save_model = save_model
-        self.model_dir = model_dir
-        self.attack_ids = attack_ids
-        self.split_mode = split_mode
-        self.test_size = float(test_size)
-    def _emit(self, text: str):
-        self.log.emit(text)
-    def run(self):
-        try:
-            if 'RSUTrainer' not in globals():
-                raise RuntimeError("تعذّر العثور على الصنف RSUTrainer داخل الملف.")
-            self.stage.emit("قراءة البيانات"); self.progress.emit(5)
-            self._emit(f"[I] تحميل CSV: {self.csv_path}")
-            df_raw = pd.read_csv(self.csv_path, low_memory=False)
-            self._emit(f"[I] عدد الصفوف: {len(df_raw):,}")
-            self.stage.emit("تهيئة المدرب"); self.progress.emit(10)
-            trainer = RSUTrainer(train_family=self.family, window_size=25)
-            self._emit(f"[I] العائلة المختارة: {self.family}")
-            sender_col = getattr(trainer, "sender_col", "sender_pseudo")
-            time_col = getattr(trainer, "time_col", "t_curr")
-            label_col = getattr(trainer, "label_col", "label")
-            attack_col = getattr(trainer, "attack_col", "attack_id")
-            if label_col not in df_raw or sender_col not in df_raw:
-                raise RuntimeError("أعمدة label/sender غير موجودة في CSV.")
-            if self.attack_ids:
-                ids = set(int(x) for x in self.attack_ids)
-                fam_mask = df_raw[attack_col].isin(ids)
-                npos_before = int((df_raw[label_col] == 1).sum())
-                df_raw.loc[df_raw[label_col] == 1, 'keep_pos'] = fam_mask & (df_raw[label_col] == 1)
-                keep = (df_raw[label_col] == 0) | (df_raw['keep_pos'] == True)
-                df_raw = df_raw.loc[keep].drop(columns=['keep_pos'])
-                self._emit(f"[I] تصفية الهجمات داخل العائلة: استخدمنا {len(ids)} attack_id — الموجبات {npos_before} → {int((df_raw[label_col]==1).sum())}.")
-            y_all = df_raw[label_col].astype(int)
-            group_col = "scenario_id" if "scenario_id" in df_raw.columns else sender_col
-            groups_all = df_raw[group_col]
-            self._emit(f"[I] Grouping by: {group_col}")
-            if self.split_mode == "holdout_group":
-                from sklearn.model_selection import GroupShuffleSplit
-                self.stage.emit(f"تقسيم (Group Holdout: test_size={self.test_size:.2f})"); self.progress.emit(20)
-                gss = GroupShuffleSplit(n_splits=1, test_size=self.test_size, random_state=42)
-                tr_idx, te_idx = next(gss.split(df_raw, groups=groups_all))
+    def _apply_numeric_transformer(self, df: pd.DataFrame) -> pd.DataFrame:
+        tfm = self.tfm
+        df2 = df.copy()
+        medians = tfm.get('medians', {})
+        for col, med in medians.items():
+            if col in df2.columns:
+                df2[col] = df2[col].fillna(med)
             else:
-                from sklearn.model_selection import StratifiedGroupKFold
-                n_splits = max(2, int(round(1.0 / max(1e-6, self.test_size))))
-                self.stage.emit(f"تقسيم (StratifiedGroupKFold: n_splits={n_splits})"); self.progress.emit(20)
-                gkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
-                tr_idx, te_idx = next(gkf.split(df_raw, y_all, groups_all))
-            raw_tr = df_raw.iloc[tr_idx].copy()
-            raw_te = df_raw.iloc[te_idx].copy()
-            self.stage.emit("هندسة الميزات (TRAIN)"); self.progress.emit(35)
-            df_tr = trainer._prepare(raw_tr)
-            self.stage.emit("هندسة الميزات (TEST)"); self.progress.emit(45)
-            df_te = trainer._prepare(raw_te)
-            drop_cols = [sender_col, time_col, label_col, attack_col]
-            X_cols_tr = [c for c in df_tr.columns if c not in drop_cols]
-            X_cols_te = [c for c in df_te.columns if c not in drop_cols]
-            common = sorted(list(set(X_cols_tr) & set(X_cols_te)))
-            if len(common) == 0:
-                raise RuntimeError("لا توجد أعمدة مشتركة بين TRAIN/TEST بعد التحضير.")
-            self._emit(f"[I] تقاطع الميزات: {len(common)} عمود.")
-            y_train_bin = df_tr[label_col].astype(int)
-            y_test_bin = df_te[label_col].astype(int)
-            groups_train, groups_test = df_tr[sender_col], df_te[sender_col]
-            cat_col = 'mb_version' if self.ohe_version and 'mb_version' in common else None
-            tfm = _fit_numeric_transformer(df_tr, common, cat_col, self._emit)
-            X_train = _apply_numeric_transformer(df_tr, common, tfm)
-            X_test = _apply_numeric_transformer(df_te, common, tfm)
-            def _hash_df(X):
-                Xr = X.copy().astype(float).round(6)
-                return pd.util.hash_pandas_object(Xr, index=False).astype(np.uint64)
-            h_tr = _hash_df(X_train)
-            h_te = _hash_df(X_test)
-            inter = np.intersect1d(h_tr.values, h_te.values)
-            self._emit(f"[CHECK] train/test duplicate rows (by features) = {len(inter)}")
-            from sklearn.metrics import roc_auc_score
-            y_perm = y_test_bin.sample(frac=1.0, random_state=7).values
-            _auc_dummy = None
-            try:
-                _auc_dummy = float(roc_auc_score(y_perm, np.random.RandomState(7).rand(len(y_perm))))
-            except Exception:
-                pass
-            self._emit(f"[CHECK] sanity AUC with random scores ≈ {_auc_dummy} (يُفترض ≈ 0.5)")
-            X_cols_final = X_train.columns.tolist()
-            self._emit(f"[I] شكل الميزات بعد التحويل: {X_train.shape[1]} عمود رقمي (TRAIN-only).")
-            from sklearn.preprocessing import StandardScaler
-            self.stage.emit("Scaling"); self.progress.emit(55)
-            scaler = StandardScaler().fit(X_train)
-            X_train_s = scaler.transform(X_train); X_test_s = scaler.transform(X_test)
-            from sklearn.calibration import CalibratedClassifierCV
-            import lightgbm as lgb
-            self.stage.emit("تدريب المصنف الثنائي"); self.progress.emit(70)
-            base = lgb.LGBMClassifier(objective='binary', class_weight='balanced', n_estimators=400, learning_rate=0.05, num_leaves=128, min_data_in_leaf=40, feature_fraction=0.9, random_state=42, min_gain_to_split=1e-12, verbosity=-1)
-            bin_calib = CalibratedClassifierCV(base, method='isotonic', cv=3)
-            bin_calib.fit(X_train_s, y_train_bin)
-            p_bin_train = bin_calib.predict_proba(X_train_s)[:, 1]
-            p_bin_test = bin_calib.predict_proba(X_test_s)[:, 1]
-            self._emit("[I] تم تدريب/معايرة المصنف الثنائي.")
-            fam_probs_train: Dict[str, np.ndarray] = {}
-            fam_probs_test: Dict[str, np.ndarray] = {}
-            fams_to_train = (['pos_speed', 'replay_stale', 'dos', 'sybil', 'disruptive'] if self.family == 'all' else ([] if self.family == 'binary' else [self.family]))
-            saved_heads = {}
-            if 'pos_speed' in fams_to_train:
-                self.stage.emit("رأس pos_speed"); self.progress.emit(78)
-                head = lgb.LGBMClassifier(objective='binary', class_weight='balanced', n_estimators=400, learning_rate=0.05, num_leaves=128, min_data_in_leaf=40, feature_fraction=0.9, random_state=42, min_gain_to_split=1e-12, verbosity=-1)
-                from sklearn.calibration import CalibratedClassifierCV as _Cal
-                pos_cal = _Cal(head, method='isotonic', cv=3)
-                y_fam_tr = trainer._build_family_labels(df_tr, 'pos_speed')
-                pos_cal.fit(X_train_s, y_fam_tr)
-                fam_probs_train['pos_speed'] = pos_cal.predict_proba(X_train_s)[:, 1]
-                fam_probs_test['pos_speed'] = pos_cal.predict_proba(X_test_s)[:, 1]
-                saved_heads['pos_speed'] = pos_cal
-                self._emit("[I] pos_speed جاهز.")
-            from sklearn.linear_model import LogisticRegression
-            from sklearn.metrics import precision_recall_curve, confusion_matrix, classification_report, roc_auc_score
-            self.stage.emit("دمج الرؤوس (Stacking)"); self.progress.emit(86)
-            def stack_build(pbin, fam_probs: Dict[str, np.ndarray]) -> np.ndarray:
-                feats = [pbin]
-                for k in ["pos_speed", "replay_stale", "dos", "sybil", "disruptive", "dos_iforest"]:
-                    if k in fam_probs:
-                        feats.append(fam_probs[k])
-                return np.vstack(feats).T
-            meta_X_tr = stack_build(p_bin_train, fam_probs_train)
-            meta_X_te = stack_build(p_bin_test, fam_probs_test)
-            meta = LogisticRegression(class_weight='balanced', max_iter=300, random_state=42)
-            meta.fit(meta_X_tr, y_train_bin)
-            p_final = meta.predict_proba(meta_X_te)[:, 1]
-            thr = 0.5
-            y_pred = (p_final >= thr).astype(int)
-            try:
-                auc = float(roc_auc_score(y_test_bin, p_final))
-            except Exception:
-                auc = None
-            report = {
-                "best_threshold": float(thr),
-                "confusion_matrix": confusion_matrix(y_test_bin, y_pred).tolist(),
-                "cls_report": classification_report(y_test_bin, y_pred, digits=4, output_dict=True),
-                "roc_auc": auc,
-            }
-            try:
-                prec, rec, _ = precision_recall_curve(y_test_bin, p_final)
-                report["pr_curve"] = {"precision": prec.tolist(), "recall": rec.tolist()}
-            except Exception:
-                report["pr_curve"] = {"precision": [], "recall": []}
-            if getattr(self, "save_model", False):
-                import joblib, datetime as _dt
-                ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-                base_dir = self.model_dir if self.model_dir else os.path.join(os.getcwd(), "models")
-                out_dir = os.path.join(base_dir, self.family, ts)
-                os.makedirs(out_dir, exist_ok=True)
-                joblib.dump({"tfm": tfm, "scaler": scaler, "X_cols_final": X_cols_final}, os.path.join(out_dir, "preproc.joblib"))
-                joblib.dump(bin_calib, os.path.join(out_dir, "bin_calib.joblib"))
-                joblib.dump(meta, os.path.join(out_dir, "meta.joblib"))
-                for name, model in saved_heads.items():
-                    joblib.dump(model, os.path.join(out_dir, f"head_{name}.joblib"))
-                with open(os.path.join(out_dir, "model_meta.json"), "w", encoding="utf-8") as f:
-                    json.dump({"family": self.family, "created": ts, "split_mode": self.split_mode, "test_size": self.test_size, "ohe_version": bool(self.ohe_version), "attack_ids_filter": self.attack_ids or [], "features_count": len(X_cols_final)}, f, ensure_ascii=False, indent=2)
-                self._emit(f"[✓] تم حفظ النموذج في: {out_dir}")
-            self.stage.emit("انتهى التدريب"); self.progress.emit(100)
-            self.finished.emit(report)
-        except Exception:
-            err = traceback.format_exc()
-            self.failed.emit(err)
+                df2[col] = med
+        cat_col = tfm.get('cat_col')
+        ohe_vals = tfm.get('ohe_values', [])
+        if cat_col is not None and ohe_vals:
+            if cat_col in df2.columns:
+                df2[cat_col] = df2[cat_col].fillna(ohe_vals[0])
+            else:
+                df2[cat_col] = ohe_vals[0]
+        for c in self.X_cols:
+            if c not in df2.columns:
+                df2[c] = 0.0
+        return df2[self.X_cols].astype(float)
 
-class MetricsTab(QWidget):
-    def __init__(self):
+    def predict_one(self, feats: Dict[str, float]) -> Dict[str, float]:
+        res = self.predict_many([feats])
+        return res[0] if res else {}
+
+    def predict_many(self, feats_list: List[Dict[str, float]]) -> List[Dict[str, float]]:
+        if not feats_list:
+            return []
+        df = pd.DataFrame(feats_list)
+        X = self._apply_numeric_transformer(df)
+        X_scaled = pd.DataFrame(self.scaler.transform(X), columns=self.X_cols)
+        p_bin = self.bin_calib.predict_proba(X_scaled)[:, 1]
+        p_pos = self.family_head.predict_proba(X_scaled)[:, 1]
+        meta_in = np.column_stack([p_bin, p_pos])
+        p_final = self.meta_model.predict_proba(meta_in)[:, 1]
+        preds = []
+        for pf, pb, pp in zip(p_final, p_bin, p_pos):
+            preds.append({'p_attack': float(pf), 'p_bin': float(pb), 'p_pos_speed': float(pp), 'pred_label': int(pf >= 0.5)})
+        return preds
+
+class CarItem(QGraphicsEllipseItem):
+
+    def __init__(self, veh_id: int, heading: float, color: QColor, dashboard: 'LiveDashboard', selected: bool=False):
+        self.base_radius = 14.0 if not selected else 18.0
+        super().__init__(-self.base_radius, -self.base_radius, 2 * self.base_radius, 2 * self.base_radius)
+        self.veh_id = veh_id
+        self.heading = heading
+        self.dashboard = dashboard
+        self.selected = selected
+        self.setBrush(QBrush(color))
+        pen = QPen(Qt.black if not selected else QColor('#ffeb3b'))
+        pen.setWidth(2 if selected else 1)
+        self.setPen(pen)
+        self.setZValue(10)
+        self.setAcceptHoverEvents(True)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+        self.setToolTip(f'Vehicle {veh_id}')
+
+    def paint(self, painter: QPainter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        super().paint(painter, option, widget)
+        if self.dashboard and self.dashboard.is_attack_highlight(self.veh_id):
+            painter.save()
+            halo_pen = QPen(QColor(198, 40, 40, 180))
+            halo_pen.setWidth(6)
+            painter.setPen(halo_pen)
+            painter.setBrush(Qt.NoBrush)
+            r = self.base_radius + 6
+            painter.drawEllipse(QRectF(-r, -r, 2 * r, 2 * r))
+            painter.restore()
+        painter.save()
+        painter.setPen(QPen(Qt.black, 2))
+        painter.rotate(-math.degrees(self.heading))
+        r = self.base_radius
+        painter.drawLine(0, 0, 0, -r - 4)
+        painter.restore()
+        rect = self.boundingRect().adjusted(0, -16, 0, 0)
+        font = painter.font()
+        font.setPointSize(9)
+        painter.setFont(font)
+        painter.setPen(Qt.black)
+        painter.drawText(rect, Qt.AlignHCenter | Qt.AlignTop, str(self.veh_id))
+
+    def mousePressEvent(self, event):
+        if self.dashboard is not None:
+            self.dashboard.on_car_clicked(self.veh_id)
+        super().mousePressEvent(event)
+
+class LiveDashboard(QMainWindow):
+
+    def __init__(self, root_dir: Path):
         super().__init__()
-        v = QVBoxLayout(self)
-        self.lbl_auc = QLabel("ROC AUC: —")
-        self.lbl_thr = QLabel("Threshold: 0.5")
-        g = QHBoxLayout(); g.addWidget(self.lbl_auc); g.addWidget(self.lbl_thr); g.addStretch()
-        v.addLayout(g)
-        self.grp_conf = QGroupBox("مصفوفة الالتباس (TN FP / FN TP)")
-        gl = QVBoxLayout(self.grp_conf)
-        self.tbl_conf = QTableWidget(2, 2)
-        self.tbl_conf.setHorizontalHeaderLabels(["Pred 0","Pred 1"])
-        self.tbl_conf.setVerticalHeaderLabels(["True 0","True 1"])
-        self.tbl_conf.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        gl.addWidget(self.tbl_conf)
-        v.addWidget(self.grp_conf)
-        self.grp_rep = QGroupBox("تقرير التصنيف (precision/recall/f1)")
-        gl2 = QVBoxLayout(self.grp_rep)
-        self.tbl_rep = QTableWidget(0, 4)
-        self.tbl_rep.setHorizontalHeaderLabels(["label","precision","recall","f1-score"])
-        gl2.addWidget(self.tbl_rep)
-        v.addWidget(self.grp_rep)
-        self.pr_canvas = MplCanvas()
-        v.addWidget(QLabel("منحنى Precision-Recall"))
-        v.addWidget(self.pr_canvas)
-        self.setLayout(v)
-    def update_metrics(self, report: Dict[str, Any]):
-        auc = report.get("roc_auc", None)
-        self.lbl_auc.setText(f"ROC AUC: {auc:.4f}" if auc is not None else "ROC AUC: —")
-        thr = report.get("best_threshold", None)
-        if thr is not None:
-            self.lbl_thr.setText(f"Threshold: {thr:.4f}")
-        cm = report.get("confusion_matrix", report.get("confusion_matrix_fixed", [[0,0],[0,0]]))
-        self.tbl_conf.setItem(0,0, QTableWidgetItem(str(cm[0][0])))
-        self.tbl_conf.setItem(0,1, QTableWidgetItem(str(cm[0][1])))
-        self.tbl_conf.setItem(1,0, QTableWidgetItem(str(cm[1][0])))
-        self.tbl_conf.setItem(1,1, QTableWidgetItem(str(cm[1][1])))
-        rep = report.get("cls_report", report.get("cls_report_fixed", {}))
-        rows = []
-        for lbl, d in rep.items():
-            if isinstance(d, dict) and all(k in d for k in ("precision","recall","f1-score")):
-                rows.append((lbl, d["precision"], d["recall"], d["f1-score"]))
-        self.tbl_rep.setRowCount(len(rows))
-        for i,(lbl,p,r,f1) in enumerate(rows):
-            self.tbl_rep.setItem(i,0, QTableWidgetItem(str(lbl)))
-            self.tbl_rep.setItem(i,1, QTableWidgetItem(f"{float(p):.4f}"))
-            self.tbl_rep.setItem(i,2, QTableWidgetItem(f"{float(r):.4f}"))
-            self.tbl_rep.setItem(i,3, QTableWidgetItem(f"{float(f1):.4f}"))
-        self.pr_canvas.ax.clear()
-        pr = report.get("pr_curve", {})
-        prec = pr.get("precision", [])
-        rec = pr.get("recall", [])
-        if prec and rec:
-            self.pr_canvas.ax.plot(rec, prec)
-            self.pr_canvas.ax.set_xlabel("Recall")
-            self.pr_canvas.ax.set_ylabel("Precision")
-            self.pr_canvas.ax.grid(True, alpha=0.3)
-        self.pr_canvas.draw()
+        self.root_dir = root_dir
+        self.setWindowTitle('VANET LuST – Live BSM Dashboard')
+        self.resize(1600, 900)
+        self.seen_files: Set[Path] = set()
+        self.vehicles: Dict[int, Dict[str, Any]] = {}
+        self.messages: List[Dict[str, Any]] = []
+        self.current_vehicle_filter: int = None
+        self.map_items: Dict[int, CarItem] = {}
+        self.selected_vehicle_id: int = None
+        self.window_size = WINDOW_SIZE
+        self.attack_highlights: Dict[int, float] = {}
+        self.pending_center_vehicle_id: int = None
+        self.sender_history: Dict[int, deque] = {}
+        self.sender_rate_state: Dict[int, Dict[str, float]] = {}
+        self.sender_state_code_map: Dict[int, Dict[Any, int]] = {}
+        self.time_base: float = None
+        self.window_sender_counts: Dict[int, Dict[int, int]] = {}
+        self.window_sender_sets: Dict[int, Set[int]] = {}
+        self.window_total_msgs: Dict[int, int] = {}
+        self.window_new_msgs: Dict[int, int] = {}
+        self.sender_first_window: Dict[int, int] = {}
+        self.sybil_rate_ewma: float = None
+        self.ids_model: IDSModel = None
+        self.global_min_x = None
+        self.global_max_x = None
+        self.global_min_y = None
+        self.global_max_y = None
+        self.per_sec_total: Dict[int, int] = {}
+        self.per_sec_attack: Dict[int, int] = {}
+        self.per_sec_vehicle_ids: Dict[int, Set[int]] = {}
+        self.per_sec_sum_speed: Dict[int, float] = {}
+        self.per_sec_count_speed: Dict[int, int] = {}
+        self.per_sec_new_veh: Dict[int, int] = {}
+        self.attack_type_counts: Dict[str, int] = {}
+        self.seen_vehicle_ids: Set[int] = set()
+        self.decision_threshold: float = 0.5
+        self.perf_history: List[Any] = []
+        self.perf_history_maxlen: int = 50000
+        if MAP_BACKGROUND_IMAGE.is_file():
+            self.map_background = QPixmap(str(MAP_BACKGROUND_IMAGE))
+        else:
+            self.map_background = None
+        self._setup_ui()
+        self._load_ids_model()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.scan_for_new_bsms)
+        self.timer.start(SCAN_INTERVAL_MS)
 
-class TrainTab(QWidget):
-    def __init__(self, metrics_tab: MetricsTab):
-        super().__init__()
-        self.metrics_tab = metrics_tab
-        v = QVBoxLayout(self)
-        form = QFormLayout()
-        self.ed_path = QLineEdit(); self.ed_path.setPlaceholderText("اختر ملف CSV للتدريب…")
-        btn_browse = QPushButton("استعراض…")
-        btn_browse.clicked.connect(self.browse)
-        h = QHBoxLayout(); h.addWidget(self.ed_path); h.addWidget(btn_browse)
-        form.addRow("ملف البيانات:", QWidget())
-        form.itemAt(form.rowCount()-1, QFormLayout.FieldRole).widget().setLayout(h)
-        self.cmb_family = QComboBox()
-        self.cmb_family.addItems(["binary","pos_speed","replay_stale","dos","sybil","disruptive","all"])
-        form.addRow("عائلة التدريب:", self.cmb_family)
-        self.chk_ohe = QCheckBox("ترميز فئوي لعمود mb_version (اختياري)")
-        self.chk_ohe.setChecked(True)
-        form.addRow("", self.chk_ohe)
-        self.chk_save = QCheckBox("حفظ النموذج بعد التدريب")
-        self.chk_save.setChecked(True)
-        form.addRow("", self.chk_save)
-        self.ed_model_dir = QLineEdit(); self.ed_model_dir.setPlaceholderText("مجلّد الحفظ (افتراضي: ./models)")
-        btn_dir = QPushButton("اختيار مجلّد…")
-        def pick_dir():
-            d = QFileDialog.getExistingDirectory(self, "اختر مجلّد الحفظ")
-            if d: self.ed_model_dir.setText(d)
-        btn_dir.clicked.connect(pick_dir)
-        hdir = QHBoxLayout(); hdir.addWidget(self.ed_model_dir); hdir.addWidget(btn_dir)
-        form.addRow("مكان الحفظ:", QWidget()); form.itemAt(form.rowCount()-1, QFormLayout.FieldRole).widget().setLayout(hdir)
-        self.ed_attacks = QLineEdit(); self.ed_attacks.setPlaceholderText("IDs للهجمات داخل العائلة (مثال: 1,2,3,4,6,7,9) — اختياري")
-        form.addRow("تصفية attack_id:", self.ed_attacks)
-        self.cmb_split = QComboBox()
-        self.cmb_split.addItems(["Group Holdout 80/20", "StratifiedGroupKFold"])
-        form.addRow("طريقة التقسيم:", self.cmb_split)
-        self.spin_test = QDoubleSpinBox()
-        self.spin_test.setDecimals(2)
-        self.spin_test.setSingleStep(0.05)
-        self.spin_test.setMinimum(0.05)
-        self.spin_test.setMaximum(0.5)
-        self.spin_test.setValue(0.2)
-        form.addRow("نسبة الاختبار:", self.spin_test)
-        v.addLayout(form)
-        hb = QHBoxLayout()
-        self.btn_start = QPushButton("بدء التدريب")
-        self.btn_start.clicked.connect(self.start_train)
-        hb.addWidget(self.btn_start)
-        hb.addStretch()
-        v.addLayout(hb)
-        self.prog = QProgressBar(); self.prog.setValue(0)
-        self.lbl_stage = QLabel("الجاهزية…")
-        v.addWidget(self.lbl_stage)
-        v.addWidget(self.prog)
-        self.log = QPlainTextEdit(); self.log.setReadOnly(True)
-        self.log.setMinimumHeight(220)
-        v.addWidget(self.log)
-        self.thread: Optional[QThread] = None
-        self.worker: Optional[TrainWorker] = None
-
-    def browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "اختر ملف CSV", "", "CSV Files (*.csv)")
-        if path:
-            self.ed_path.setText(path)
-
-    def _log_metrics_summary(self, report: Dict[str, Any]):
-        def _fmt(x):
-            try:
-                return f"{float(x):.4f}"
-            except Exception:
-                return str(x)
-        lines = []
-        lines.append("== ملخّص المؤشرات ==")
-        thr = report.get("best_threshold")
-        if thr is not None:
-            lines.append(f"Threshold = {thr:.4f}")
-        auc = report.get("roc_auc", None)
-        if auc is not None:
-            lines.append(f"ROC AUC = {auc:.4f}")
-        cm = (report.get("confusion_matrix") or report.get("confusion_matrix_fixed") or report.get("confusion_matrix_adaptive"))
-        if cm is not None:
-            try:
-                tn, fp = cm[0]
-                fn, tp = cm[1]
-                lines.append("Confusion Matrix [TN FP / FN TP]:")
-                lines.append(f"TN={tn}, FP={fp}, FN={fn}, TP={tp}")
-            except Exception:
-                lines.append(f"Confusion Matrix = {cm}")
-        rep = (report.get("cls_report") or report.get("cls_report_fixed") or report.get("cls_report_adaptive") or {})
-        for lbl in ["0", "1", "macro avg", "weighted avg"]:
-            d = rep.get(lbl)
-            if isinstance(d, dict):
-                p = _fmt(d.get("precision")) if d.get("precision") is not None else "—"
-                r = _fmt(d.get("recall")) if d.get("recall") is not None else "—"
-                f1 = _fmt(d.get("f1-score")) if d.get("f1-score") is not None else "—"
-                s = d.get("support")
-                s = int(s) if isinstance(s, (int, float)) else "—"
-                lines.append(f"{lbl}: P={p}  R={r}  F1={f1}  (n={s})")
-        used = report.get("used_families")
-        if used:
-            lines.append("الرؤوس المستخدمة: " + ", ".join(used))
-        self.log.appendPlainText("\n".join(lines))
-
-    def start_train(self):
-        path = self.ed_path.text().strip()
-        if not path or not os.path.exists(path):
-            QMessageBox.warning(self, "تنبيه", "الرجاء اختيار ملف CSV صالح.")
-            return
-        family = self.cmb_family.currentText()
-        ohe = self.chk_ohe.isChecked()
-        save = self.chk_save.isChecked()
-        model_dir = self.ed_model_dir.text().strip()
-        att = self.ed_attacks.text().strip()
-        attack_ids = None
-        if att:
-            try:
-                attack_ids = [int(x) for x in att.replace(' ', '').split(',') if x != '']
-            except Exception:
-                QMessageBox.warning(self, "تنبيه", "صيغة attack_id غير صحيحة. استخدم أرقام مفصولة بفواصل.")
-                return
-        split_mode = "holdout_group" if self.cmb_split.currentIndex() == 0 else "sgkfold"
-        test_size = float(self.spin_test.value())
-        self.btn_start.setEnabled(False)
-        self.prog.setValue(0)
-        self.lbl_stage.setText("بدء...")
-        self.log.clear()
-        self.thread = QThread()
-        self.worker = TrainWorker(path, family, ohe, save, model_dir, attack_ids, split_mode, test_size)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.log.connect(self.on_log)
-        self.worker.stage.connect(self.on_stage)
-        self.worker.progress.connect(self.prog.setValue)
-        self.worker.finished.connect(self.on_done)
-        self.worker.failed.connect(self.on_fail)
-        self.worker.finished.connect(lambda _: self.thread.quit())
-        self.worker.failed.connect(lambda _: self.thread.quit())
-        self.thread.finished.connect(lambda: self.btn_start.setEnabled(True))
-        self.thread.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.start()
-
-    def on_log(self, text: str):
-        self.log.appendPlainText(text)
-
-    def on_stage(self, s: str):
-        self.lbl_stage.setText(s)
-        self.log.appendPlainText(f"== {s} ==")
-
-    def on_done(self, report: Dict[str, Any]):
-        self._log_metrics_summary(report)
-        self.log.appendPlainText("[✓] اكتمل التدريب.")
-        self.metrics_tab.update_metrics(report)
-
-    def on_fail(self, err: str):
-        self.log.appendPlainText("[X] حدث خطأ أثناء التدريب:\n" + err)
-        QMessageBox.critical(self, "خطأ", "فشل التدريب. تحقق من السجل.")
-
-class MainWin(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("RSU Trainer — واجهة التدريب (All-in-One v7)")
-        self.resize(1200, 800)
-        tabs = QTabWidget(); tabs.setDocumentMode(True)
-        self.metrics_tab = MetricsTab()
-        self.train_tab = TrainTab(self.metrics_tab)
-        tabs.addTab(self.train_tab, "التدريب")
-        tabs.addTab(self.metrics_tab, "المؤشرات")
+    def _setup_ui(self):
+        tabs = QTabWidget()
         self.setCentralWidget(tabs)
-        self.statusBar().showMessage("جاهز")
+        tab_live = QWidget()
+        v_layout = QVBoxLayout(tab_live)
+        splitter = QSplitter(Qt.Horizontal)
+        self.tbl_vehicles = QTableWidget()
+        self.tbl_vehicles.setColumnCount(9)
+        self.tbl_vehicles.setHorizontalHeaderLabels(['SenderPseudo', 'Last time', 'Speed', 'X', 'Y', 'Label (GT)', 'Last AttackType', 'Pred label', 'Pred p_attack'])
+        self.tbl_vehicles.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_vehicles.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tbl_vehicles.setSelectionMode(QTableWidget.SingleSelection)
+        self.tbl_vehicles.setAlternatingRowColors(True)
+        self.tbl_vehicles.itemSelectionChanged.connect(self.on_vehicle_selected)
+        self.tbl_messages = QTableWidget()
+        self.tbl_messages.setColumnCount(11)
+        self.tbl_messages.setHorizontalHeaderLabels(['Time', 'Receiver', 'Sender', 'X', 'Y', 'Speed', 'Label (GT)', 'AttackType', 'File', 'Pred label', 'Pred p_attack'])
+        self.tbl_messages.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_messages.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tbl_messages.setAlternatingRowColors(True)
+        splitter.addWidget(self.tbl_vehicles)
+        splitter.addWidget(self.tbl_messages)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        v_layout.addWidget(splitter)
+        tabs.addTab(tab_live, 'Live – Tables')
+        tab_map = QWidget()
+        map_layout = QVBoxLayout(tab_map)
+        stats_layout = QHBoxLayout()
+        self.lbl_total_veh = QLabel('Vehicles: 0')
+        self.lbl_attack_veh = QLabel('Attack vehicles: 0')
+        self.lbl_benign_veh = QLabel('Benign vehicles: 0')
+        self.lbl_total_msgs = QLabel('Messages: 0')
+        self.lbl_attack_msgs = QLabel('Attack msgs: 0')
+        for lbl in (self.lbl_total_veh, self.lbl_attack_veh, self.lbl_benign_veh, self.lbl_total_msgs, self.lbl_attack_msgs):
+            stats_layout.addWidget(lbl)
+        stats_layout.addStretch()
+        map_layout.addLayout(stats_layout)
+        self.map_scene = QGraphicsScene(self)
+        self.map_view = QGraphicsView(self.map_scene)
+        self.map_view.setRenderHint(QPainter.Antialiasing, True)
+        self.map_view.setDragMode(QGraphicsView.ScrollHandDrag)
+        map_layout.addWidget(self.map_view)
+        self.sel_title = QLabel('Selected vehicle: none')
+        self.sel_title.setStyleSheet('font-weight: bold;')
+        self.sel_basic = QLabel('Time: -   Speed: -   Label: -   Attack: -')
+        self.sel_pos = QLabel('Pos: -   Heading: -   Receiver: -')
+        self.sel_conf = QLabel('Conf: pos=( -, - )  spd=( -, - )  acc=( -, - )  head=( -, - )')
+        for lbl in (self.sel_title, self.sel_basic, self.sel_pos, self.sel_conf):
+            lbl.setStyleSheet('font-size: 11px;')
+        map_layout.addWidget(self.sel_title)
+        map_layout.addWidget(self.sel_basic)
+        map_layout.addWidget(self.sel_pos)
+        map_layout.addWidget(self.sel_conf)
+        legend_layout = QHBoxLayout()
+        legend_layout.addWidget(self._make_color_legend('#2e7d32', 'Benign'))
+        legend_layout.addWidget(self._make_color_legend('#c62828', 'Attack'))
+        legend_layout.addStretch()
+        map_layout.addLayout(legend_layout)
+        tabs.addTab(tab_map, 'Map')
+        tab_analytics = QWidget()
+        anal_layout = QVBoxLayout(tab_analytics)
+        self.analytics_graph = pg.GraphicsLayoutWidget()
+        anal_layout.addWidget(self.analytics_graph)
+        self.plot_msg_rate = self.analytics_graph.addPlot(title='Messages per second')
+        self.plot_msg_rate.setLabel('bottom', 'Sim time (s)')
+        self.plot_msg_rate.setLabel('left', '#Msg/s')
+        self.plot_msg_rate.showGrid(x=True, y=True, alpha=0.3)
+        self.cur_msg_rate = self.plot_msg_rate.plot(pen=pg.mkPen('#90caf9', width=2))
+        self.analytics_graph.nextColumn()
+        self.plot_veh_rate = self.analytics_graph.addPlot(title='Vehicles per second')
+        self.plot_veh_rate.setLabel('bottom', 'Sim time (s)')
+        self.plot_veh_rate.setLabel('left', '#Veh/s')
+        self.plot_veh_rate.showGrid(x=True, y=True, alpha=0.3)
+        self.cur_veh_rate = self.plot_veh_rate.plot(pen=pg.mkPen('#81c784', width=2))
+        self.analytics_graph.nextColumn()
+        self.plot_attack_rate = self.analytics_graph.addPlot(title='Attack messages per second')
+        self.plot_attack_rate.setLabel('bottom', 'Sim time (s)')
+        self.plot_attack_rate.setLabel('left', '#Atk/s')
+        self.plot_attack_rate.showGrid(x=True, y=True, alpha=0.3)
+        self.cur_attack_rate = self.plot_attack_rate.plot(pen=pg.mkPen('#ef5350', width=2))
+        self.analytics_graph.nextRow()
+        self.plot_cum_msg = self.analytics_graph.addPlot(title='Cumulative messages')
+        self.plot_cum_msg.setLabel('bottom', 'Sim time (s)')
+        self.plot_cum_msg.setLabel('left', 'Total msgs')
+        self.plot_cum_msg.showGrid(x=True, y=True, alpha=0.3)
+        self.cur_cum_msg = self.plot_cum_msg.plot(pen=pg.mkPen('#42a5f5', width=2))
+        self.analytics_graph.nextColumn()
+        self.plot_cum_attack = self.analytics_graph.addPlot(title='Cumulative attacks')
+        self.plot_cum_attack.setLabel('bottom', 'Sim time (s)')
+        self.plot_cum_attack.setLabel('left', 'Total attacks')
+        self.plot_cum_attack.showGrid(x=True, y=True, alpha=0.3)
+        self.cur_cum_attack = self.plot_cum_attack.plot(pen=pg.mkPen('#e53935', width=2))
+        self.analytics_graph.nextColumn()
+        self.plot_cum_veh = self.analytics_graph.addPlot(title='Cumulative vehicles')
+        self.plot_cum_veh.setLabel('bottom', 'Sim time (s)')
+        self.plot_cum_veh.setLabel('left', 'Vehicles')
+        self.plot_cum_veh.showGrid(x=True, y=True, alpha=0.3)
+        self.cur_cum_veh = self.plot_cum_veh.plot(pen=pg.mkPen('#66bb6a', width=2))
+        self.analytics_graph.nextRow()
+        self.plot_attack_ratio = self.analytics_graph.addPlot(title='Attack ratio')
+        self.plot_attack_ratio.setLabel('bottom', 'Sim time (s)')
+        self.plot_attack_ratio.setLabel('left', 'Ratio')
+        self.plot_attack_ratio.showGrid(x=True, y=True, alpha=0.3)
+        self.cur_attack_ratio = self.plot_attack_ratio.plot(pen=pg.mkPen('#ffca28', width=2))
+        self.analytics_graph.nextColumn()
+        self.plot_avg_speed = self.analytics_graph.addPlot(title='Average speed')
+        self.plot_avg_speed.setLabel('bottom', 'Sim time (s)')
+        self.plot_avg_speed.setLabel('left', 'Speed')
+        self.plot_avg_speed.showGrid(x=True, y=True, alpha=0.3)
+        self.cur_avg_speed = self.plot_avg_speed.plot(pen=pg.mkPen('#ab47bc', width=2))
+        self.analytics_graph.nextColumn()
+        self.plot_attack_types = self.analytics_graph.addPlot(title='Attack types (cumulative)')
+        self.plot_attack_types.setLabel('bottom', 'Attack type')
+        self.plot_attack_types.setLabel('left', 'Count')
+        self.plot_attack_types.showGrid(x=True, y=True, alpha=0.3)
+        self.attack_bar_item = None
+        tabs.addTab(tab_analytics, 'Analytics')
+        tab_perf = QWidget()
+        perf_layout = QVBoxLayout(tab_perf)
+        self.perf_lbl_title = QLabel('Detection performance (BSM-level)')
+        self.perf_lbl_title.setStyleSheet('font-weight: bold; font-size: 12px;')
+        self.perf_lbl_sub = QLabel('Cumulative since first message (all processed, not limited by table) + last 500 messages')
+        self.perf_lbl_sub.setStyleSheet('font-size: 11px; color: #555;')
+        self.perf_lbl_thresh = QLabel('Decision threshold: 0.50 (auto)')
+        self.perf_lbl_thresh.setStyleSheet('font-size: 11px; color: #333;')
+        self.perf_lbl_counts = QLabel('Evaluated msgs: 0 | TP: 0 | FP: 0 | FN: 0 | TN: 0')
+        self.perf_lbl_metrics = QLabel('Accuracy: - | Precision: - | Recall: - | F1: -')
+        self.perf_lbl_recent = QLabel('Last 500 msgs -> Accuracy: - | Precision: - | Recall: - | F1: -')
+        self.perf_lbl_rates = QLabel('Rates: FPR: - | FNR: - | Pred attack ratio: -')
+        self.perf_lbl_probs = QLabel('Scores mean (overall/last500) -> attack: -/- | benign: -/- | overall: -/-')
+        for lbl in (self.perf_lbl_thresh, self.perf_lbl_counts, self.perf_lbl_metrics, self.perf_lbl_recent, self.perf_lbl_rates, self.perf_lbl_probs):
+            lbl.setStyleSheet('font-size: 11px;')
+        perf_layout.addWidget(self.perf_lbl_title)
+        perf_layout.addWidget(self.perf_lbl_sub)
+        perf_layout.addWidget(self.perf_lbl_thresh)
+        perf_layout.addWidget(self.perf_lbl_counts)
+        perf_layout.addWidget(self.perf_lbl_metrics)
+        perf_layout.addWidget(self.perf_lbl_recent)
+        perf_layout.addWidget(self.perf_lbl_rates)
+        perf_layout.addWidget(self.perf_lbl_probs)
+        perf_layout.addStretch()
+        tabs.addTab(tab_perf, 'Performance')
+        tab_log = QWidget()
+        log_layout = QVBoxLayout(tab_log)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        log_layout.addWidget(QLabel('Event log'))
+        log_layout.addWidget(self.log_view)
+        tabs.addTab(tab_log, 'Log')
 
-if __name__ == "__main__":
+    def _load_ids_model(self):
+        try:
+            self.ids_model = IDSModel(MODEL_DIR)
+            self.append_log('<b>[IDS]</b> model loaded successfully.')
+        except Exception as e:
+            self.ids_model = None
+            self.append_log(f"<span style='color:orange'>[IDS] failed to load model: {e}</span>")
+
+    def _make_color_legend(self, color_hex: str, text: str) -> QWidget:
+        w = QWidget()
+        layout = QHBoxLayout(w)
+        swatch = QLabel()
+        swatch.setFixedSize(16, 16)
+        swatch.setStyleSheet(f'background-color: {color_hex}; border-radius: 3px;')
+        label = QLabel(text)
+        layout.addWidget(swatch)
+        layout.addWidget(label)
+        layout.setContentsMargins(0, 0, 0, 0)
+        return w
+
+    def on_vehicle_selected(self):
+        sel = self.tbl_vehicles.selectedItems()
+        if not sel:
+            self.current_vehicle_filter = None
+            self.update_messages_table()
+            return
+        sender_item = sel[0]
+        try:
+            sender = int(sender_item.text())
+        except ValueError:
+            sender = None
+        self.current_vehicle_filter = sender
+        self.update_messages_table()
+
+    def on_car_clicked(self, veh_id: int):
+        self.selected_vehicle_id = veh_id
+        self.update_map_view()
+        for row in range(self.tbl_vehicles.rowCount()):
+            item = self.tbl_vehicles.item(row, 0)
+            if item is not None:
+                try:
+                    if int(item.text()) == veh_id:
+                        self.tbl_vehicles.selectRow(row)
+                        break
+                except ValueError:
+                    continue
+        veh = self.vehicles.get(veh_id)
+        if veh:
+            r = veh.get('last_rec', {})
+            self.sel_title.setText(f'Selected vehicle: {veh_id}')
+            self.sel_basic.setText(f"Time={veh['last_time']:.3f} s   Speed={veh['speed']:.2f} m/s   Label={veh['label']}   Attack={veh['attack_type']}")
+            self.sel_pos.setText(f"Pos=({veh['x']:.1f}, {veh['y']:.1f})   Heading={veh['heading']:.2f} rad   Receiver={r.get('receiver_pseudo', '-')}")
+            self.sel_conf.setText('Conf: pos=({:.3f}, {:.3f})  spd=({:.3f}, {:.3f})  acc=({:.3f}, {:.3f})  head=({:.3f}, {:.3f})'.format(r.get('pos_conf_x', 0.0), r.get('pos_conf_y', 0.0), r.get('spd_conf_x', 0.0), r.get('spd_conf_y', 0.0), r.get('acc_conf_x', 0.0), r.get('acc_conf_y', 0.0), r.get('head_conf_x', 0.0), r.get('head_conf_y', 0.0)))
+            self.append_log(f"<b>Vehicle {veh_id} selected</b>: time={veh['last_time']:.3f}, speed={veh['speed']:.1f}, label={veh['label']}, attack={veh['attack_type']}")
+            item = self.map_items.get(veh_id)
+            if item:
+                self.map_view.centerOn(item)
+        if self.pending_center_vehicle_id == veh_id:
+            self.pending_center_vehicle_id = None
+
+    def is_attack_highlight(self, veh_id: int) -> bool:
+        expiry = self.attack_highlights.get(veh_id)
+        if expiry is None:
+            return False
+        if time.time() > expiry:
+            self.attack_highlights.pop(veh_id, None)
+            if self.pending_center_vehicle_id == veh_id:
+                self.pending_center_vehicle_id = None
+            return False
+        return True
+
+    def scan_for_new_bsms(self):
+        bsm_dirs = sorted(self.root_dir.glob('MDBsms_V2_*'))
+        if not bsm_dirs:
+            return
+        new_data: List[Any] = []
+        for d in bsm_dirs:
+            for f in sorted(d.glob('*.bsm')):
+                if f in self.seen_files:
+                    continue
+                try:
+                    rec = parse_bsm_file(f)
+                except Exception as e:
+                    self.append_log(f"<span style='color:orange'>[!] Error parsing {f.name}: {e}</span>")
+                    self.seen_files.add(f)
+                    continue
+                self.seen_files.add(f)
+                feats = None
+                if self.ids_model is not None:
+                    try:
+                        feats = self._build_feature_row(rec)
+                    except Exception as e:
+                        self.append_log(f"<span style='color:orange'>[IDS] feature build error for sender {rec.get('sender_pseudo', '-')}: {e}</span>")
+                new_data.append((rec, feats))
+        if not new_data:
+            return
+        det_results: List[Dict[str, Any]] = [{} for _ in new_data]
+        if self.ids_model is not None:
+            feats_only = [ft for _, ft in new_data if ft is not None]
+            if feats_only:
+                try:
+                    preds = self.ids_model.predict_many(feats_only)
+                    preds_iter = iter(preds)
+                    for i, (_rec, ft) in enumerate(new_data):
+                        if ft is not None:
+                            det_results[i] = next(preds_iter, {})
+                except Exception as e:
+                    self.append_log(f"<span style='color:orange'>[IDS] batch prediction error: {e}</span>")
+        for (rec, _ft), det in zip(new_data, det_results):
+            self.handle_new_record(rec, det)
+        self.update_vehicle_table()
+        self.update_messages_table()
+        self.update_stats_labels()
+        self.update_map_view()
+        self.update_analytics_charts()
+        self.update_performance_tab()
+
+    def _normalize_time_value(self, t_raw: Any) -> float:
+        try:
+            t = float(t_raw)
+        except Exception:
+            return 0.0
+        if t > 1000000000000000.0:
+            return t / 1000000000.0
+        if t > 1000000000000.0:
+            return t / 1000000.0
+        if t > 1000000000.0:
+            return t / 1000.0
+        return t
+
+    def _build_feature_row(self, rec: Dict[str, Any]) -> Dict[str, float]:
+        sender = rec['sender_pseudo']
+        t_norm = self._normalize_time_value(rec.get('creation_time', 0.0))
+        gen_t_norm = self._normalize_time_value(rec.get('meta_generation_time', t_norm))
+        t = t_norm
+        gen_t = gen_t_norm
+        x = float(rec.get('x', 0.0))
+        y = float(rec.get('y', 0.0))
+        vx = float(rec.get('vx', 0.0))
+        vy = float(rec.get('vy', 0.0))
+        heading = float(rec.get('heading', 0.0))
+        speed_curr = mag(vx, vy)
+        hist = self.sender_history.get(sender)
+        if hist is None:
+            hist = deque(maxlen=self.window_size)
+            self.sender_history[sender] = hist
+        prev = hist[-1] if hist else None
+        t_prev = prev['time'] if prev else t
+        dt = max(t - t_prev, 0.0)
+        dt_safe = dt if dt > EPS else EPS
+        x_prev = prev['x'] if prev else x
+        y_prev = prev['y'] if prev else y
+        speed_prev = prev['speed_curr'] if prev else speed_curr
+        heading_prev = prev['heading'] if prev else heading
+        acc_prev = prev['acc_curr'] if prev else 0.0
+        dx = x - x_prev
+        dy = y - y_prev
+        dist = mag(dx, dy)
+        dv = speed_curr - speed_prev
+        acc_curr = dv / dt_safe
+        dacc = acc_curr - acc_prev
+        dacc_jerk = dacc / dt_safe
+        jerk = dacc / dt_safe
+        dtheta = heading - heading_prev
+        heading_rate = dtheta / dt_safe
+        x_pred = x_prev + speed_prev * math.cos(heading_prev) * dt
+        y_pred = y_prev + speed_prev * math.sin(heading_prev) * dt
+        dr_dx = x - x_pred
+        dr_dy = y - y_pred
+        dr_angle = math.atan2(dr_dy, dr_dx)
+        sin_a = math.sin(dr_angle)
+        cos_a = math.cos(dr_angle)
+        consistency_err = abs(dist - speed_curr * dt)
+        flag_consistency = 1.0 if consistency_err > max(1.0, 0.25 * speed_curr * dt_safe) else 0.0
+        state_hash = (round(x, 3), round(y, 3), round(speed_curr, 2), round(heading, 2))
+        code_map = self.sender_state_code_map.setdefault(sender, {})
+        if state_hash in code_map:
+            state_code = code_map[state_hash]
+        else:
+            state_code = len(code_map)
+            code_map[state_hash] = state_code
+        hist_with_curr = list(hist) + [{'dt': dt, 'dv': dv, 'heading_rate': heading_rate, 'dist': dist, 'consistency_err': consistency_err, 'dacc_jerk': dacc_jerk, 'dr_angle': dr_angle, 'acc_curr': acc_curr, 'speed_curr': speed_curr, 'state_code': state_code}]
+
+        def stats(key: str):
+            vals = [float(h.get(key, 0.0)) for h in hist_with_curr]
+            if not vals:
+                return (0.0, 0.0, 0.0)
+            mean = sum(vals) / len(vals)
+            if len(vals) > 1:
+                var = sum(((v - mean) ** 2 for v in vals)) / (len(vals) - 1)
+                std = math.sqrt(max(var, 0.0))
+            else:
+                std = 0.0
+            return (mean, std, max(vals))
+        dist_mean, dist_std, dist_max = stats('dist')
+        ce_mean, _, _ = stats('consistency_err')
+        jerk_mean, jerk_std, jerk_max = stats('dacc_jerk')
+        dt_mean, dt_std, dt_max = stats('dt')
+        dv_mean, dv_std, dv_max = stats('dv')
+        hr_mean, hr_std, hr_max = stats('heading_rate')
+        dt_cv = dt_std / dt_mean if dt_mean > 0 else 0.0
+        dt_vals = [float(h.get('dt', 0.0)) for h in hist_with_curr]
+        if dt_vals:
+            dt_med = float(np.median(dt_vals))
+            dt_mad = float(np.median(np.abs(np.array(dt_vals) - dt_med)) + EPS)
+            dt_z = (dt - dt_med) / dt_mad
+        else:
+            dt_med = 0.0
+            dt_mad = EPS
+            dt_z = 0.0
+        sin_list = [math.sin(float(h.get('dr_angle', 0.0))) for h in hist_with_curr]
+        cos_list = [math.cos(float(h.get('dr_angle', 0.0))) for h in hist_with_curr]
+        if sin_list:
+            sin_mean = sum(sin_list) / len(sin_list)
+            cos_mean = sum(cos_list) / len(cos_list)
+            dr_angle_var = 1.0 - math.sqrt(cos_mean ** 2 + sin_mean ** 2)
+        else:
+            dr_angle_var = 0.0
+
+        def ratio(vals, predicate):
+            if not vals:
+                return 0.0
+            return sum((1 for v in vals if predicate(v))) / len(vals)
+        freeze_ratio_dist = ratio([h.get('dist', 0.0) for h in hist_with_curr], lambda v: abs(v) < 0.001)
+        freeze_ratio_dv = ratio([h.get('dv', 0.0) for h in hist_with_curr], lambda v: abs(v) < 0.0001)
+        freeze_ratio_hr = ratio([h.get('heading_rate', 0.0) for h in hist_with_curr], lambda v: abs(v) < 0.0001)
+        low_speed_flag = 1.0 if speed_curr < 0.5 else 0.0
+        low_speed_ratio = ratio([h.get('speed_curr', 0.0) for h in hist_with_curr], lambda v: v < 0.5)
+        neg_acc_flag = 1.0 if acc_curr < -0.3 else 0.0
+        neg_acc_ratio = ratio([h.get('acc_curr', 0.0) for h in hist_with_curr], lambda v: v < -0.3)
+        eff = self.window_size - 1
+        times = [float(h.get('time', 0.0)) for h in hist] + [t]
+        if len(times) > 1:
+            idx_prev = max(0, len(times) - 1 - eff)
+            span = t - times[idx_prev]
+            span = span if span > EPS else EPS
+            rate = min(eff, len(times) - 1) / span
+        else:
+            rate = 0.0
+        rate_state = self.sender_rate_state.get(sender, {'ewma': rate, 'cumsum_pos': 0.0, 'cumsum_neg': 0.0, 'cusum_pos': 0.0, 'cusum_neg': 0.0})
+        alpha_rate = 2.0 / (self.window_size + 1)
+        ewma = alpha_rate * rate + (1 - alpha_rate) * rate_state.get('ewma', rate)
+        r = rate - ewma
+        cumsum_pos = max(0.0, rate_state.get('cumsum_pos', 0.0) + r)
+        cumsum_neg = max(0.0, rate_state.get('cumsum_neg', 0.0) - r)
+        cusum_pos = max(rate_state.get('cusum_pos', 0.0), cumsum_pos)
+        cusum_neg = max(rate_state.get('cusum_neg', 0.0), cumsum_neg)
+        self.sender_rate_state[sender] = {'ewma': ewma, 'cumsum_pos': cumsum_pos, 'cumsum_neg': cumsum_neg, 'cusum_pos': cusum_pos, 'cusum_neg': cusum_neg}
+        state_codes = [int(h.get('state_code', -1)) for h in hist] + [int(state_code)]
+        if state_codes:
+            state_dup_ratio = 1.0 - len(set(state_codes)) / len(state_codes)
+        else:
+            state_dup_ratio = 0.0
+        window_id = int(gen_t // 5)
+        if sender not in self.sender_first_window:
+            self.sender_first_window[sender] = window_id
+        is_new_id = 1 if window_id == self.sender_first_window.get(sender, window_id) else 0
+        self.window_total_msgs[window_id] = self.window_total_msgs.get(window_id, 0) + 1
+        if is_new_id:
+            self.window_new_msgs[window_id] = self.window_new_msgs.get(window_id, 0) + 1
+        counts = self.window_sender_counts.setdefault(window_id, {})
+        counts[sender] = counts.get(sender, 0) + 1
+        self.window_sender_counts[window_id] = counts
+        cur_set = set(counts.keys())
+        self.window_sender_sets[window_id] = cur_set
+        prev_set = self.window_sender_sets.get(window_id - 1, set())
+        union = cur_set | prev_set
+        inter = cur_set & prev_set
+        jaccard = len(inter) / len(union) if union else 0.0
+        total_w = self.window_total_msgs.get(window_id, 1)
+        new_w = self.window_new_msgs.get(window_id, 0)
+        sybil_new_rate = new_w / total_w
+        prev_ewma = self.sybil_rate_ewma if self.sybil_rate_ewma is not None else sybil_new_rate
+        alpha_sybil = 2.0 / (8 + 1)
+        self.sybil_rate_ewma = alpha_sybil * sybil_new_rate + (1 - alpha_sybil) * prev_ewma
+        sybil_burst = sybil_new_rate - prev_ewma
+        probs = []
+        total_counts = sum(counts.values())
+        if total_counts > 0:
+            for c in counts.values():
+                p = c / total_counts
+                probs.append(p)
+        entropy = -sum((p * math.log(p + 1e-09) for p in probs)) if probs else 0.0
+        hist.append({'time': t, 'x': x, 'y': y, 'speed_curr': speed_curr, 'acc_curr': acc_curr, 'heading': heading, 'dt': dt, 'dv': dv, 'dist': dist, 'dacc_jerk': dacc_jerk, 'heading_rate': heading_rate, 'consistency_err': consistency_err, 'dr_angle': dr_angle, 'state_code': state_code})
+        feats: Dict[str, float] = {}
+        feats['acc_conf_x_curr'] = float(rec.get('acc_conf_x', 0.0))
+        feats['acc_conf_y_curr'] = float(rec.get('acc_conf_y', 0.0))
+        feats['acc_curr'] = acc_curr
+        feats['acc_prev'] = acc_prev
+        feats['consistency_err'] = consistency_err
+        feats['consistency_err_mean_w25'] = ce_mean
+        feats['cos_a'] = cos_a
+        feats['dacc'] = dacc
+        feats['dacc_jerk'] = dacc_jerk
+        feats['dacc_jerk_max_w25'] = jerk_max
+        feats['dacc_jerk_mean_w25'] = jerk_mean
+        feats['dacc_jerk_std_w25'] = jerk_std
+        feats['dist'] = dist
+        feats['dist_max_w25'] = dist_max
+        feats['dist_mean_w25'] = dist_mean
+        feats['dist_std_w25'] = dist_std
+        feats['dr_angle'] = dr_angle
+        feats['dr_angle_var_w25'] = dr_angle_var
+        feats['dr_dx'] = dr_dx
+        feats['dr_dy'] = dr_dy
+        feats['dt'] = dt
+        feats['dt_cv_w'] = dt_cv
+        feats['dt_jitter_w25'] = dt_std
+        feats['dt_max_w25'] = dt_max
+        feats['dt_mean_w25'] = dt_mean
+        feats['dt_std_w25'] = dt_std
+        feats['dt_z'] = dt_z
+        feats['dtheta'] = dtheta
+        feats['dv'] = dv
+        feats['dv_max_w25'] = dv_max
+        feats['dv_mean_w25'] = dv_mean
+        feats['dv_std_w25'] = dv_std
+        feats['dx'] = dx
+        feats['dy'] = dy
+        feats['flag_consistency'] = flag_consistency
+        feats['freeze_ratio_dist_w25'] = freeze_ratio_dist
+        feats['freeze_ratio_dv_w25'] = freeze_ratio_dv
+        feats['freeze_ratio_hr_w25'] = freeze_ratio_hr
+        feats['head_conf_x_curr'] = float(rec.get('head_conf_x', 0.0))
+        feats['head_conf_y_curr'] = float(rec.get('head_conf_y', 0.0))
+        feats['heading_curr'] = heading
+        feats['heading_prev'] = heading_prev
+        feats['heading_rate'] = heading_rate
+        feats['heading_rate_max_w25'] = hr_max
+        feats['heading_rate_mean_w25'] = hr_mean
+        feats['heading_rate_std_w25'] = hr_std
+        feats['jerk'] = jerk
+        feats['low_speed_flag'] = low_speed_flag
+        feats['low_speed_ratio_w25'] = low_speed_ratio
+        feats['neg_acc_flag'] = neg_acc_flag
+        feats['neg_acc_ratio_w25'] = neg_acc_ratio
+        feats['pos_conf_x_curr'] = float(rec.get('pos_conf_x', 0.0))
+        feats['pos_conf_y_curr'] = float(rec.get('pos_conf_y', 0.0))
+        feats['rate_cusum_neg'] = cusum_neg
+        feats['rate_cusum_pos'] = cusum_pos
+        feats['rate_ewma'] = ewma
+        feats['rate_msgs_per_s'] = rate
+        feats['receiver_pseudo'] = float(rec.get('receiver_pseudo', 0.0))
+        feats['sin_a'] = sin_a
+        feats['spd_conf_x_curr'] = float(rec.get('spd_conf_x', 0.0))
+        feats['spd_conf_y_curr'] = float(rec.get('spd_conf_y', 0.0))
+        feats['speed_curr'] = speed_curr
+        feats['speed_prev'] = speed_prev
+        feats['state_code'] = float(state_code)
+        feats['state_dup_ratio_w'] = state_dup_ratio
+        feats['sybil_jaccard_ids_5s'] = jaccard
+        feats['sybil_new_ids_burst'] = sybil_burst
+        feats['sybil_new_ids_rate'] = sybil_new_rate
+        feats['sybil_sender_entropy_5s'] = entropy
+        feats['sybil_unique_ids_5s'] = float(len(cur_set))
+        feats['t_prev'] = t_prev
+        feats['window_id'] = window_id
+        feats['x_curr'] = x
+        feats['x_prev'] = x_prev
+        feats['y_curr'] = y
+        feats['y_prev'] = y_prev
+        return feats
+
+    def _detect_with_model(self, rec: Dict[str, Any]) -> Dict[str, Any]:
+        if self.ids_model is None:
+            return {}
+        try:
+            feats = self._build_feature_row(rec)
+            det = self.ids_model.predict_one(feats)
+            return det
+        except Exception as e:
+            self.append_log(f"<span style='color:orange'>[IDS] prediction error for sender {rec.get('sender_pseudo', '-')}: {e}</span>")
+            return {}
+
+    def _update_cumulative_performance(self, msg: Dict[str, Any]):
+        score = msg.get('det_score')
+        if score is None:
+            return
+        try:
+            s_val = float(score)
+            gt = int(msg.get('label'))
+        except Exception:
+            return
+        self.perf_history.append((s_val, gt))
+        if len(self.perf_history) > self.perf_history_maxlen:
+            self.perf_history = self.perf_history[-self.perf_history_maxlen:]
+        self._maybe_update_threshold()
+
+    def _maybe_update_threshold(self):
+        if len(self.perf_history) < 300:
+            return
+        scores = np.array([s for s, _ in self.perf_history], dtype=float)
+        labels = np.array([l for _, l in self.perf_history], dtype=int)
+        qs = np.linspace(0.05, 0.95, 19)
+        ths = np.unique(np.concatenate([np.array([0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85], dtype=float), np.quantile(scores, qs)]))
+        best_th = self.decision_threshold
+        best_f1 = -1.0
+        min_precision = 0.7
+        for th in ths:
+            pred = scores >= th
+            tp = int(((pred == 1) & (labels == 1)).sum())
+            fp = int(((pred == 1) & (labels == 0)).sum())
+            fn = int(((pred == 0) & (labels == 1)).sum())
+            if tp + fp == 0 or tp + fn == 0:
+                continue
+            prec = tp / (tp + fp)
+            rec = tp / (tp + fn)
+            if prec < min_precision:
+                continue
+            f1 = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
+            if f1 > best_f1 + 1e-06:
+                best_f1 = f1
+                best_th = float(th)
+        if best_f1 > -0.5 and abs(best_th - self.decision_threshold) > 0.0001:
+            self.decision_threshold = best_th
+            self._apply_threshold_to_state()
+
+    def _apply_threshold_to_state(self):
+        for m in self.messages:
+            score = m.get('det_score')
+            if score is None:
+                continue
+            m['det_label'] = 1 if score >= self.decision_threshold else 0
+        for vid, v in self.vehicles.items():
+            score = v.get('det_score')
+            if score is None:
+                continue
+            v['det_label'] = 1 if score >= self.decision_threshold else 0
+        self.update_vehicle_table()
+        self.update_messages_table()
+
+    def trigger_attack_alert(self, sender: int, x: float, y: float, score: float=None):
+        now = time.time()
+        self.attack_highlights[sender] = now + 5.0
+        self.pending_center_vehicle_id = sender
+        self.selected_vehicle_id = sender
+        msg = f'[ALERT] Attack detected: sender={sender}, pos=({x:.1f},{y:.1f})'
+        if score is not None:
+            msg += f', score={score:.3f}'
+        self.append_log(f"<span style='color:red'><b>{msg}</b></span>")
+        self.statusBar().showMessage(msg, 5000)
+
+    def handle_new_record(self, rec: Dict[str, Any], det_result: Dict[str, Any]=None):
+        sender = rec['sender_pseudo']
+        t = rec['creation_time']
+        sec = int(t)
+        sp = mag(rec['vx'], rec['vy'])
+        x, y = (rec['x'], rec['y'])
+        if self.global_min_x is None:
+            self.global_min_x = self.global_max_x = x
+            self.global_min_y = self.global_max_y = y
+        else:
+            self.global_min_x = min(self.global_min_x, x)
+            self.global_max_x = max(self.global_max_x, x)
+            self.global_min_y = min(self.global_min_y, y)
+            self.global_max_y = max(self.global_max_y, y)
+        veh = self.vehicles.get(sender, {'sender_pseudo': sender, 'last_time': t, 'x': rec['x'], 'y': rec['y'], 'speed': sp, 'label': rec['label'], 'attack_type': rec['attack_type'], 'heading': rec['heading'], 'last_rec': rec, 'det_label': 0, 'det_score': None})
+        veh['last_time'] = t
+        veh['x'] = rec['x']
+        veh['y'] = rec['y']
+        veh['speed'] = sp
+        veh['label'] = rec['label']
+        veh['attack_type'] = rec['attack_type']
+        veh['heading'] = rec['heading']
+        veh['last_rec'] = rec
+        det = det_result if det_result is not None else self._detect_with_model(rec)
+        if det:
+            score = det.get('p_attack', None)
+            veh['det_score'] = score
+            veh['det_label'] = 1 if score is not None and score >= self.decision_threshold else 0
+            if veh['det_label'] == 1:
+                self.trigger_attack_alert(sender, rec['x'], rec['y'], veh.get('det_score'))
+        self.vehicles[sender] = veh
+        msg = {'time': t, 'receiver': rec['receiver_pseudo'], 'sender': sender, 'x': rec['x'], 'y': rec['y'], 'speed': sp, 'label': rec['label'], 'attack_type': rec['attack_type'], 'file': rec['file_path'], 'det_label': veh.get('det_label', rec['label']), 'det_score': veh.get('det_score', None)}
+        self._update_cumulative_performance(msg)
+        self.messages.append(msg)
+        if len(self.messages) > MAX_MESSAGES:
+            self.messages = self.messages[-MAX_MESSAGES:]
+        self.per_sec_total[sec] = self.per_sec_total.get(sec, 0) + 1
+        if rec['label'] == 1:
+            self.per_sec_attack[sec] = self.per_sec_attack.get(sec, 0) + 1
+            atype = rec['attack_type'] or rec['meta_attack_type'] or 'Unknown'
+            self.attack_type_counts[atype] = self.attack_type_counts.get(atype, 0) + 1
+        self.per_sec_vehicle_ids.setdefault(sec, set()).add(sender)
+        self.per_sec_sum_speed[sec] = self.per_sec_sum_speed.get(sec, 0.0) + sp
+        self.per_sec_count_speed[sec] = self.per_sec_count_speed.get(sec, 0) + 1
+        if sender not in self.seen_vehicle_ids:
+            self.seen_vehicle_ids.add(sender)
+            self.per_sec_new_veh[sec] = self.per_sec_new_veh.get(sec, 0) + 1
+        if rec['label'] == 1:
+            self.append_log(f"<span style='color:red'><b>ALERT</b> [t={t:.3f}] sender={sender} recv={rec['receiver_pseudo']} speed={sp:.1f} attack={rec['attack_type']}</span>")
+        else:
+            self.append_log(f"[t={t:.3f}] sender={sender} recv={rec['receiver_pseudo']} speed={sp:.1f} label={rec['label']} attack={rec['attack_type']}")
+
+    def update_vehicle_table(self):
+        rows = list(self.vehicles.values())
+        rows.sort(key=lambda r: r['last_time'])
+        self.tbl_vehicles.setRowCount(len(rows))
+        for i, v in enumerate(rows):
+            det_label = v.get('det_label', 0)
+            det_score = v.get('det_score', None)
+            items = [str(v['sender_pseudo']), f"{v['last_time']:.3f}", f"{v['speed']:.2f}", f"{v['x']:.1f}", f"{v['y']:.1f}", str(v['label']), v['attack_type'], str(det_label), '-' if det_score is None else f'{det_score:.3f}']
+            for j, text in enumerate(items):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                if det_label == 1:
+                    item.setBackground(QColor('#ffcdd2'))
+                self.tbl_vehicles.setItem(i, j, item)
+
+    def update_messages_table(self):
+        if self.current_vehicle_filter is None:
+            rows = self.messages
+        else:
+            rows = [m for m in self.messages if m['sender'] == self.current_vehicle_filter]
+        rows = list(rows)[-MAX_MESSAGES:]
+        rows.sort(key=lambda r: r['time'], reverse=True)
+        self.tbl_messages.setRowCount(len(rows))
+        for i, m in enumerate(rows):
+            det_label = m.get('det_label', 0)
+            det_score = m.get('det_score', None)
+            items = [f"{m['time']:.3f}", str(m['receiver']), str(m['sender']), f"{m['x']:.1f}", f"{m['y']:.1f}", f"{m['speed']:.2f}", str(m['label']), m['attack_type'], os.path.basename(m['file']), str(det_label), '-' if det_score is None else f'{det_score:.3f}']
+            for j, text in enumerate(items):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                if det_label == 1:
+                    if j == 0:
+                        item.setBackground(QColor('#c62828'))
+                        item.setForeground(Qt.white)
+                    else:
+                        item.setBackground(QColor('#ffcdd2'))
+                self.tbl_messages.setItem(i, j, item)
+
+    def update_stats_labels(self):
+        total_veh = len(self.vehicles)
+        attack_veh = sum((1 for v in self.vehicles.values() if v['label'] == 1))
+        benign_veh = total_veh - attack_veh
+        total_msgs = len(self.messages)
+        attack_msgs = sum((1 for m in self.messages if m['label'] == 1))
+        self.lbl_total_veh.setText(f'Vehicles: {total_veh}')
+        self.lbl_attack_veh.setText(f'Attack vehicles: {attack_veh}')
+        self.lbl_benign_veh.setText(f'Benign vehicles: {benign_veh}')
+        self.lbl_total_msgs.setText(f'Messages: {total_msgs}')
+        self.lbl_attack_msgs.setText(f'Attack msgs: {attack_msgs}')
+
+    def update_map_view(self):
+        self.map_scene.clear()
+        self.map_items.clear()
+        if self.map_background is not None and (not self.map_background.isNull()):
+            img_w = self.map_background.width()
+            img_h = self.map_background.height()
+            bg_item = self.map_scene.addPixmap(self.map_background)
+            bg_item.setPos(0, 0)
+            bg_item.setZValue(-100)
+        else:
+            img_w = img_h = 1000
+        if not self.vehicles:
+            self.map_scene.setSceneRect(0, 0, img_w, img_h)
+            self.map_view.fitInView(self.map_scene.sceneRect(), Qt.KeepAspectRatio)
+            return
+        if self.global_min_x is None or self.global_max_x is None or self.global_min_y is None or (self.global_max_y is None):
+            xs = [v['x'] for v in self.vehicles.values()]
+            ys = [v['y'] for v in self.vehicles.values()]
+            gmin_x, gmax_x = (min(xs), max(xs))
+            gmin_y, gmax_y = (min(ys), max(ys))
+        else:
+            gmin_x, gmax_x = (self.global_min_x, self.global_max_x)
+            gmin_y, gmax_y = (self.global_min_y, self.global_max_y)
+        sim_w = max(gmax_x - gmin_x, 1.0)
+        sim_h = max(gmax_y - gmin_y, 1.0)
+        for vid, v in self.vehicles.items():
+            nx = (v['x'] - gmin_x) / sim_w
+            ny = (v['y'] - gmin_y) / sim_h
+            px = nx * img_w * MAP_EXTRA_SCALE + MAP_OFFSET_X
+            py = (1.0 - ny) * img_h * MAP_EXTRA_SCALE + MAP_OFFSET_Y
+            det_label = v.get('det_label', 0)
+            color = QColor('#c62828') if det_label == 1 else QColor('#2e7d32')
+            heading = float(v.get('heading', 0.0))
+            car = CarItem(veh_id=vid, heading=heading, color=color, dashboard=self, selected=vid == self.selected_vehicle_id or self.is_attack_highlight(vid))
+            car.setPos(px, py)
+            self.map_scene.addItem(car)
+            self.map_items[vid] = car
+            if self.pending_center_vehicle_id == vid and self.is_attack_highlight(vid):
+                self.map_view.centerOn(car)
+        self.map_scene.setSceneRect(0, 0, img_w, img_h)
+        self.map_view.fitInView(self.map_scene.sceneRect(), Qt.KeepAspectRatio)
+        self.append_log(f'MAP DEBUG: {len(self.vehicles)} vehicles, x∈[{gmin_x:.1f},{gmax_x:.1f}], y∈[{gmin_y:.1f},{gmax_y:.1f}]')
+
+    def update_analytics_charts(self):
+        if not self.messages:
+            self.cur_msg_rate.setData([], [])
+            self.cur_veh_rate.setData([], [])
+            self.cur_attack_rate.setData([], [])
+            self.cur_cum_msg.setData([], [])
+            self.cur_cum_attack.setData([], [])
+            self.cur_cum_veh.setData([], [])
+            self.cur_attack_ratio.setData([], [])
+            self.cur_avg_speed.setData([], [])
+            self.plot_attack_types.clear()
+            self.attack_bar_item = None
+            return
+        max_time = max((m['time'] for m in self.messages))
+        max_sec = int(max_time)
+        min_sec = max(0, max_sec - ANALYTICS_WINDOW_SECS + 1)
+        secs = list(range(min_sec, max_sec + 1))
+        totals = []
+        attacks = []
+        veh_rates = []
+        avg_speeds = []
+        ratios = []
+        cum_msg = []
+        cum_atk = []
+        cum_veh = []
+        running_msg = 0
+        running_atk = 0
+        running_veh = 0
+        for s in secs:
+            tot = self.per_sec_total.get(s, 0)
+            atk = self.per_sec_attack.get(s, 0)
+            veh_set = self.per_sec_vehicle_ids.get(s, set())
+            veh_rate = len(veh_set)
+            sum_sp = self.per_sec_sum_speed.get(s, 0.0)
+            cnt_sp = self.per_sec_count_speed.get(s, 0)
+            avg_sp = sum_sp / cnt_sp if cnt_sp > 0 else 0.0
+            new_veh = self.per_sec_new_veh.get(s, 0)
+            running_msg += tot
+            running_atk += atk
+            running_veh += new_veh
+            totals.append(tot)
+            attacks.append(atk)
+            veh_rates.append(veh_rate)
+            avg_speeds.append(avg_sp)
+            ratios.append(atk / tot if tot > 0 else 0.0)
+            cum_msg.append(running_msg)
+            cum_atk.append(running_atk)
+            cum_veh.append(running_veh)
+        self.cur_msg_rate.setData(secs, totals)
+        self.cur_veh_rate.setData(secs, veh_rates)
+        self.cur_attack_rate.setData(secs, attacks)
+        self.cur_cum_msg.setData(secs, cum_msg)
+        self.cur_cum_attack.setData(secs, cum_atk)
+        self.cur_cum_veh.setData(secs, cum_veh)
+        self.cur_attack_ratio.setData(secs, ratios)
+        self.cur_avg_speed.setData(secs, avg_speeds)
+        self.plot_attack_types.clear()
+        types = sorted(self.attack_type_counts.keys())
+        if types:
+            xs = list(range(len(types)))
+            heights = [self.attack_type_counts[t] for t in types]
+            self.attack_bar_item = pg.BarGraphItem(x=xs, height=heights, width=0.6, brush=pg.mkBrush('#ef5350'))
+            self.plot_attack_types.addItem(self.attack_bar_item)
+            ax = self.plot_attack_types.getAxis('bottom')
+            ax.setTicks([[(i, t) for i, t in enumerate(types)]])
+
+    def update_performance_tab(self):
+
+        def fmt(v):
+            return '-' if v is None else f'{v:.3f}'
+
+        def compute_from_scores(hist: List[Any], th: float):
+            tp = fp = fn = tn = 0
+            pred_attack = 0
+            for score, gt in hist:
+                pred = 1 if score >= th else 0
+                pred_attack += pred
+                if pred == 1 and gt == 1:
+                    tp += 1
+                elif pred == 1 and gt == 0:
+                    fp += 1
+                elif pred == 0 and gt == 1:
+                    fn += 1
+                else:
+                    tn += 1
+            total = tp + fp + fn + tn
+            if total == 0:
+                return dict(tp=0, fp=0, fn=0, tn=0, total=0)
+            acc = (tp + tn) / total
+            prec = tp / (tp + fp) if tp + fp > 0 else None
+            rec = tp / (tp + fn) if tp + fn > 0 else None
+            fpr = fp / (fp + tn) if fp + tn > 0 else None
+            fnr = fn / (tp + fn) if tp + fn > 0 else None
+            f1 = 2 * prec * rec / (prec + rec) if prec is not None and rec is not None and (prec + rec > 0) else None
+            return dict(tp=tp, fp=fp, fn=fn, tn=tn, total=total, acc=acc, prec=prec, rec=rec, f1=f1, fpr=fpr, fnr=fnr, pred_attack_ratio=pred_attack / total if total > 0 else None)
+
+        def prob_stats(hist: List[Any]):
+            atk_scores = [s for s, l in hist if l == 1]
+            ben_scores = [s for s, l in hist if l == 0]
+            all_scores = [s for s, _ in hist]
+            return (np.mean(atk_scores) if atk_scores else None, np.mean(ben_scores) if ben_scores else None, np.mean(all_scores) if all_scores else None)
+        all_hist = list(self.perf_history)
+        recent_hist = all_hist[-500:]
+        stats = compute_from_scores(all_hist, self.decision_threshold)
+        r_stats = compute_from_scores(recent_hist, self.decision_threshold)
+        atk_mean, ben_mean, all_mean = prob_stats(all_hist)
+        r_atk_mean, r_ben_mean, r_all_mean = prob_stats(recent_hist)
+        self.perf_lbl_thresh.setText(f'Decision threshold: {self.decision_threshold:.3f} (auto, N={len(all_hist)})')
+        self.perf_lbl_counts.setText(f"Evaluated msgs: {stats.get('total', 0)} | TP: {stats.get('tp', 0)} | FP: {stats.get('fp', 0)} | FN: {stats.get('fn', 0)} | TN: {stats.get('tn', 0)}")
+        self.perf_lbl_metrics.setText('Accuracy: {} | Precision: {} | Recall: {} | F1: {}'.format(fmt(stats.get('acc')), fmt(stats.get('prec')), fmt(stats.get('rec')), fmt(stats.get('f1'))))
+        self.perf_lbl_recent.setText(f"Last 500 msgs -> N={r_stats.get('total', 0)} | Accuracy: {fmt(r_stats.get('acc'))} | Precision: {fmt(r_stats.get('prec'))} | Recall: {fmt(r_stats.get('rec'))} | F1: {fmt(r_stats.get('f1'))}")
+        self.perf_lbl_rates.setText('Rates: FPR: {} | FNR: {} | Pred attack ratio: {}'.format(fmt(stats.get('fpr')), fmt(stats.get('fnr')), fmt(stats.get('pred_attack_ratio'))))
+        self.perf_lbl_probs.setText('Scores mean (overall/last500) -> attack: {}/{} | benign: {}/{} | overall: {}/{}'.format(fmt(atk_mean), fmt(r_atk_mean), fmt(ben_mean), fmt(r_ben_mean), fmt(all_mean), fmt(r_all_mean)))
+
+    def append_log(self, text: str):
+        self.log_view.append(text)
+
+def main():
     app = QApplication(sys.argv)
-    w = MainWin()
-    w.show()
+    app.setStyle('Fusion')
+    win = LiveDashboard(ROOT_DIR)
+    win.show()
     sys.exit(app.exec_())
+if __name__ == '__main__':
+    main()
