@@ -28,6 +28,31 @@ Core idea:
 
 ---
 
-## Citation
+## Libraries used
 
-If you build on this work, please cite the study and this repository. A BibTeX entry will be added once the public DOI is finalized.
+Core:
+- `numpy`, `pandas`
+- `scikit-learn`, `joblib`
+
+GUI & visualization:
+- `PyQt5`
+- `pyqtgraph`
+- `matplotlib`
+
+Training / ML (depending on enabled heads and configuration):
+- `lightgbm`
+- `tensorflow` (for sequence models if enabled)
+
+Utilities:
+- `argparse`, `pathlib`, `json`, `logging` (standard library)
+
+---
+
+## Installation
+
+### Option A — Conda (recommended)
+```bash
+conda create -n vanet-ids python=3.10 -y
+conda activate vanet-ids
+
+pip install numpy pandas scikit-learn joblib pyqt5 pyqtgraph matplotlib lightgbm tensorflow
